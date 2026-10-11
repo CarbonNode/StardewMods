@@ -1,6 +1,6 @@
 {
   "Name": "Shared Day",
-  "Author": "CarbonNode",
+  "Author": "squeetsqub",
   "Version": "0.1.35",
   "Description": "Experimental shared-calendar co-op: take turns on a farm day, then advance together.",
   "UniqueID": "CarbonNode.SharedDay",

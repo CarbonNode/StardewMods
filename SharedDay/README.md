@@ -1,5 +1,7 @@
 # Shared Day
 
+by **squeetsqub**
+
 **Turn-based co-op for Stardew Valley 1.6.** Everybody plays the same farm day, one after another. Alice waters the crops in the morning and finishes her day; Bob logs on in the evening and gets his own 6:00 AM of the same date, with Alice's work already done. When everyone has played (or been skipped), the night runs and the farm moves on together.
 
 > **BETA:** in active testing, still working out bugs. Back up your save first. Made with AI assistance.

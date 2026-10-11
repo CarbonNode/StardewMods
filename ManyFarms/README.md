@@ -1,5 +1,7 @@
 # Many Farms
 
+by **squeetsqub**
+
 **Several farms in one Stardew Valley co-op game.** Each player picks a farm when they join, or starts a new one on any land type, and a Farmstead Totem set down in the world takes anyone to any farm.
 
 > **BETA:** in active testing, still working out bugs. Back up your save first. Made with AI assistance; the in-game map and farmstead art are AI-generated.
