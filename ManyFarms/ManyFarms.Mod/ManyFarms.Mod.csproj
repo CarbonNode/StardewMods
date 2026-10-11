@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net6.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>10</LangVersion>
+    <AssemblyName>ManyFarms</AssemblyName>
+    <RootNamespace>ManyFarms.Mod</RootNamespace>
+    <Version>0.5.2</Version>
+    <EnableModDeploy>false</EnableModDeploy>
+    <EnableHarmony>true</EnableHarmony>
+    <EnableModZip>true</EnableModZip>
+    <ModFolderName>ManyFarms</ModFolderName>
+    <!-- The commit id stays out of the assembly, so a commit that changes only tests or docs builds the same file
+         (same SHA-256) as the one the labs played. -->
+    <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
+  </PropertyGroup>
+  <ItemGroup>
+    <!-- The real-game test driver reads the mod's own state; it is never shipped. -->
+    <InternalsVisibleTo Include="ManyFarms.Acceptance" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="Pathoschild.Stardew.ModBuildConfig" Version="4.4.0" />
+    <ProjectReference Include="../ManyFarms.Core/ManyFarms.Core.csproj" />
+  </ItemGroup>
+</Project>

@@ -1,0 +1,22 @@
+{
+  "Name": "Shared Day",
+  "Author": "CarbonNode",
+  "Version": "0.1.35",
+  "Description": "Experimental shared-calendar co-op: take turns on a farm day, then advance together.",
+  "UniqueID": "CarbonNode.SharedDay",
+  "EntryDll": "SharedDay.dll",
+  "MinimumApiVersion": "4.1.0",
+  "Dependencies": [
+    {
+      "UniqueID": "JunimoHost.Server",
+      "IsRequired": false
+    },
+    {
+      "UniqueID": "spacechase0.GenericModConfigMenu",
+      "IsRequired": false
+    }
+  ],
+  "UpdateKeys": [
+    "Nexus:53757"
+  ]
+}
