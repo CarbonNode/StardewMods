@@ -1,6 +1,6 @@
 ![Shared Day](media/header.png)
 
-# Stardew Mods by squeetsqub
+# Stardew Mods by squeetsquib
 
 Two SMAPI mods for Stardew Valley 1.6 co-op:
 
@@ -72,11 +72,11 @@ dotnet test ManyFarms/ManyFarms.Tests
 
 `tools/build-release.py <mods-dir> <out-dir> --nexus-id 53757` packs `manifest.json`, the DLLs and Many Farms' `assets/` from built mod folders into `Shared Day <version>.zip` and `Many Farms <version>.zip`. It never packs `config.json`, `backups/` or logs, which on a host carry its farm password hash and join address.
 
-## License
+## Credits
 
-[MIT](LICENSE), by squeetsqub. Bug reports and pull requests are welcome.
+By squeetsquib. Bug reports and pull requests are welcome.
 
-The mods' SMAPI IDs stay `CarbonNode.SharedDay` and `CarbonNode.ManyFarms` (and their save-data keys keep that prefix): changing a UniqueID would break existing saves, update checks and the two mods' APIs. The released 0.1.35 / 0.5.2 zips still list the old author name; the next release carries `squeetsqub`.
+The mods' SMAPI IDs stay `CarbonNode.SharedDay` and `CarbonNode.ManyFarms` (and their save-data keys keep that prefix): changing a UniqueID would break existing saves, update checks and the two mods' APIs. The released 0.1.35 / 0.5.2 zips still list the old author name; the next release carries `squeetsquib`.
 
 ---
 
