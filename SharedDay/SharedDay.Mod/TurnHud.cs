@@ -321,8 +321,10 @@ public sealed class TurnHud
         {
             try
             {
-                // The game's own small portrait (the one in the multiplayer list), 16 pixels at 2.5x.
-                farmer.FarmerRenderer.drawMiniPortrat(b, new Vector2(cell.X, cell.Y), 0.89f, 2.5f * k, 2, farmer, alpha);
+                // Their face as the farm sees them (0.1.44): the game's own small portrait, with the
+                // accessory and the hat it leaves out. The picture is 20 sprite pixels square, so a
+                // hat has its room and the head keeps the middle of the cell.
+                MiniFace.Draw(b, farmer, new Vector2(cell.X, cell.Y), cell.Width / (float)MiniFace.Span, alpha);
                 drawn = true;
             }
             catch (Exception ex)

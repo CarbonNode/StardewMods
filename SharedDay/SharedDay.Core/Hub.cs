@@ -24,6 +24,13 @@ public sealed record HubLink(
     public const string Schema = "modrelay.shared-day-link/1";
     public static readonly HubLink Empty = new(null, null, null, null, null, null, null, null, null);
 
+    /// <summary>The signed-in ModRelay account's id (0.1.37, the link's `account`), or null without one.</summary>
+    public string? AccountId { get; init; }
+    /// <summary>That account's display name.</summary>
+    public string? AccountName { get; init; }
+    /// <summary>The join ticket the launcher fetched at Play (<see cref="JoinTicket"/>), or null.</summary>
+    public string? Ticket { get; init; }
+
     /// <summary>
     /// A way into the farm that is worth offering. A host PC that says it is asleep, starting or
     /// off is believed over an address it shared earlier: nothing is listening there.
@@ -46,6 +53,7 @@ public sealed record HubLink(
             var group = Child(root, "group");
             var farm = Child(root, "farm");
             var host = Child(root, "host");
+            var account = Child(root, "account");
             return new HubLink(
                 Text(farm, "label"),
                 Text(group, "name"),
@@ -55,7 +63,8 @@ public sealed record HubLink(
                 Text(host, "joinAddress"),
                 Text(host, "joinCode"),
                 Text(host, "name"),
-                Text(host, "state"));
+                Text(host, "state"))
+            { AccountId = Text(account, "id"), AccountName = Text(account, "name"), Ticket = Text(account, "ticket") };
         }
         catch (JsonException) { return null; }
     }
@@ -118,6 +127,14 @@ public sealed record HubHost(string Name, string State, bool WakePending, bool W
 
 public sealed record HubFarmer(string Name, string Status, bool Online, string? Player)
 {
+    /// <summary>The farmer's id (the report's id), as text; null from a report without one.</summary>
+    public string? Id { get; init; }
+    /// <summary>The ModRelay account this farmer belongs to (0.1.37: the host's `owner_id`, else the member who picked it), or null.</summary>
+    public string? OwnerId { get; init; }
+    /// <summary>That account's name, when known.</summary>
+    public string? OwnerName { get; init; }
+    /// <summary>A group member with no farmer yet, standing on the roster (0.1.37).</summary>
+    public bool Placeholder { get; init; }
     /// <summary>Part of the turn in progress (the report's inCurrentTurn). False from a report without it.</summary>
     public bool InTurn { get; init; }
     /// <summary>
@@ -167,9 +184,15 @@ public sealed record HubFarm(
 
             // Who plays which farmer, from the accounts that joined the tracker.
             var players = new Dictionary<string, string>();
+            var playerIds = new Dictionary<string, string>();
+            var names = new Dictionary<string, string>();
             if (root.TryGetProperty("members", out var members) && members.ValueKind == JsonValueKind.Array)
                 foreach (var m in members.EnumerateArray())
-                    if (HubLink.Text(m, "farmer_id") is { } id && HubLink.Text(m, "display_name") is { } name) players[id] = name;
+                {
+                    string? account = HubLink.Text(m, "account_id"), display = HubLink.Text(m, "display_name");
+                    if (account is not null && display is not null) names[account] = display;
+                    if (HubLink.Text(m, "farmer_id") is { } id && display is not null) { players[id] = display; if (account is not null) playerIds[id] = account; }
+                }
 
             var farmers = new List<HubFarmer>();
             if (snap.TryGetProperty("farmers", out var list) && list.ValueKind == JsonValueKind.Array)
@@ -179,10 +202,18 @@ public sealed record HubFarm(
                     // A farmer with no name yet still has a turn; the launcher calls them the same.
                     string name = HubLink.Text(f, "name") ?? "A farmer";
                     string? id = HubLink.Text(f, "id");
+                    // Whose farmer it is: the host's own record first, else the member who picked it in the launcher.
+                    string? ownerId = HubLink.Text(f, "owner_id") ?? (id is not null && playerIds.TryGetValue(id, out var picked) ? picked : null);
+                    string? ownerName = HubLink.Text(f, "owner_name") ?? (ownerId is not null && names.TryGetValue(ownerId, out var known) ? known
+                        : id is not null && players.TryGetValue(id, out var player) ? player : null);
                     farmers.Add(new HubFarmer(name, HubLink.Text(f, "status") ?? "Pending",
                         f.TryGetProperty("online", out var on) && on.ValueKind == JsonValueKind.True,
-                        id is not null && players.TryGetValue(id, out var player) ? player : null)
+                        id is not null && players.TryGetValue(id, out var playing) ? playing : ownerName)
                     {
+                        Id = id,
+                        OwnerId = ownerId,
+                        OwnerName = ownerName,
+                        Placeholder = f.TryGetProperty("placeholder", out var ph) && ph.ValueKind == JsonValueKind.True,
                         InTurn = f.TryGetProperty("inCurrentTurn", out var turn) && turn.ValueKind == JsonValueKind.True,
                         Away = f.TryGetProperty("away", out var away) && away.ValueKind == JsonValueKind.True
                     });

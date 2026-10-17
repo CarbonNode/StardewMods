@@ -7,22 +7,23 @@ using StardewValley;
 namespace SharedDay.Mod;
 
 /// <summary>
-/// The farmers' faces for the turn tracker: the game's own small portrait of each farmer (the
-/// one in the multiplayer list and on the turn board), drawn off screen on the host and kept as
-/// a small PNG, so the ModRelay launcher can show who is who without anyone uploading a picture.
+/// The farmers' faces for the turn tracker: each farmer's face as the farm sees them (MiniFace -
+/// the game's own small portrait, with the accessory and hat it leaves out), drawn off screen on
+/// the host and kept as a small PNG, so the ModRelay launcher can show who is who without anyone
+/// uploading a picture.
 /// One farmer is drawn per call, a new face first and then whichever is oldest, so a changed
 /// hairstyle or hat reaches the tracker within about a minute per farmer on the farm.
 /// </summary>
 internal sealed class FarmerPortraits
 {
     /// <summary>
-    /// The game's portrait at 2x fills 28 by 24 pixels, two in from the left and six down from where
-    /// it is asked to draw (measured on a real capture, lab lan-401). The origin puts that face in
-    /// the middle of a 32-pixel square, which a launcher shows one to one.
+    /// The picture is the face's own square (SharedDay.Core.FaceLayout.Span: a 16-pixel head with
+    /// the two pixels a hat overhangs it by on each side) at 2x, so 40 pixels, which a launcher
+    /// shows in its own slot. Before 0.1.44 it was a 32-pixel square of the game's small portrait,
+    /// which had no room for a hat and drew no accessory at all.
     /// </summary>
-    private const int Size = 32;
+    private const int Size = FaceLayout.Span * 2;
     private const float Scale = 2f;
-    private static readonly Vector2 Origin = new(0, -2);
     private static readonly TimeSpan Refresh = TimeSpan.FromSeconds(60);
 
     private readonly IMonitor monitor;
@@ -88,7 +89,7 @@ internal sealed class FarmerPortraits
             device.SetRenderTarget(target);
             device.Clear(Color.Transparent);
             batch.Begin(SpriteSortMode.Deferred, BlendState.AlphaBlend, SamplerState.PointClamp);
-            farmer.FarmerRenderer.drawMiniPortrat(batch, Origin, 0.89f, Scale, 2, farmer);
+            MiniFace.Draw(batch, farmer, Vector2.Zero, Scale);
             batch.End();
         }
         finally

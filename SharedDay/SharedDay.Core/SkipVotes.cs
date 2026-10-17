@@ -41,9 +41,9 @@ public sealed class SkipVoteBook
 
     public static bool CanBeSkipped(FarmerSnapshot farmer) => farmer.Status == FarmerStatus.Pending && !farmer.IsOnline;
 
-    /// <summary>Everyone with a say on skipping <paramref name="target"/>.</summary>
+    /// <summary>Everyone with a say on skipping <paramref name="target"/>. A group member with no farmer yet (0.1.37) has none: nobody is there to cast it.</summary>
     public static IReadOnlyList<long> Electorate(IEnumerable<FarmerSnapshot> roster, long target) =>
-        roster.Where(f => f.Id != target && f.Status != FarmerStatus.Skipped).Select(f => f.Id).ToArray();
+        roster.Where(f => f.Id != target && f.Status != FarmerStatus.Skipped && !f.IsPlaceholder).Select(f => f.Id).ToArray();
 
     public SkipVoteResult Cast(int day, long voter, long target, IReadOnlyCollection<FarmerSnapshot> roster)
     {

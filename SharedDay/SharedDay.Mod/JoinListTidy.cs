@@ -26,13 +26,16 @@ internal static class JoinListTidy
 {
     private static IMonitor monitor = null!;
     private static Func<bool> enabled = () => true;
+    /// <summary>0.1.37: this PC's own ModRelay account, and the farmers that belong to other accounts (by the owner's name), from the farm's tracker.</summary>
+    private static Func<(string? Me, IReadOnlyDictionary<long, string> Owners)> owners = () => (null, new Dictionary<long, string>());
     private static bool failed;
     private static System.Reflection.FieldInfo? hoverField;
 
-    public static void Install(Harmony harmony, IMonitor log, Func<bool> isEnabled)
+    public static void Install(Harmony harmony, IMonitor log, Func<bool> isEnabled, Func<(string? Me, IReadOnlyDictionary<long, string> Owners)>? ownedByOthers = null)
     {
         monitor = log;
         enabled = isEnabled;
+        if (ownedByOthers is not null) owners = ownedByOthers;
         try
         {
             var target = AccessTools.DeclaredMethod(typeof(FarmhandMenu), "checkListPopulation")
@@ -94,11 +97,19 @@ internal static class JoinListTidy
             if (slots.Any(slot => slot is not FarmhandMenu.FarmhandSlot || slot is Row)) return;
             var theirs = slots.Cast<FarmhandMenu.FarmhandSlot>().ToList();
             if (theirs.Any(slot => slot.Farmer is null)) return;
-            var plan = JoinList.Plan(theirs.Select(slot => new JoinRow(slot.Farmer.isCustomized.Value, slot.BelongsToAnotherPlayer())).ToList());
+            // 0.1.37: a farmer that belongs to another ModRelay account is locked the way the game
+            // locks another Steam player's farmer, with the owner's name under it. The host turns
+            // such a pick away anyway; this spares the player the trip.
+            IReadOnlyDictionary<long, string> others;
+            try { others = owners().Owners; }
+            catch (Exception ex) { others = new Dictionary<long, string>(); monitor.Log("Could not read whose farmers are whose for the join screen: " + ex.Message, LogLevel.Trace); }
+            string? OwnerOf(FarmhandMenu.FarmhandSlot slot) => slot.Farmer.isCustomized.Value && others.TryGetValue(slot.Farmer.UniqueMultiplayerID, out var owner) ? owner : null;
+            var plan = JoinList.Plan(theirs.Select(slot => new JoinRow(slot.Farmer.isCustomized.Value, slot.BelongsToAnotherPlayer() || OwnerOf(slot) is not null)).ToList());
             if (plan.Rows.Count == 0) return;
             var tidy = new List<LoadGameMenu.MenuSlot>(plan.Rows.Count);
             foreach (int index in plan.Rows)
                 tidy.Add(index == JoinList.NoRoomRow ? Row.ForNoRoom(__instance, theirs[0].Farmer)
+                    : OwnerOf(theirs[index]) is { } owner ? Row.Owned(__instance, theirs[index].Farmer, owner)
                     : new Row(__instance, theirs[index].Farmer, index == plan.NewFarmerRow ? plan.FreeCabins : 0));
             __instance.MenuSlots = tidy;
             // The list is shorter now: the game laid its four rows and its scroll arrows out for the long one.
@@ -124,17 +135,19 @@ internal static class JoinListTidy
     private sealed class Row : FarmhandMenu.FarmhandSlot
     {
         private readonly LoadGameMenu list;
-        /// <summary>For the one "make a new farmer" row: how many empty cabins it stands for. 0 on a made farmer's row.</summary>
-        private readonly int freeCabins;
 
         /// <summary>The line a full farm shows in place of the new-farmer row. It holds no farmer of its own and cannot be picked.</summary>
         public bool NoRoom { get; private init; }
 
+        /// <summary>Another ModRelay account's farmer (0.1.37): whose, for the line under the name. Null for a farmer this player may pick.</summary>
+        public string? Owner { get; private init; }
+
+        /// <param name="freeCabins">How many empty cabins the new-farmer row stands for; no longer shown (0.1.39, "cabins shouldn't matter"), kept for the plan's sake.</param>
         public Row(FarmhandMenu menu, Farmer farmer, int freeCabins)
             : base(menu, farmer)
         {
             list = menu;
-            this.freeCabins = freeCabins;
+            _ = freeCabins;
         }
 
         /// <param name="anyFarmer">
@@ -144,6 +157,10 @@ internal static class JoinListTidy
         public static Row ForNoRoom(FarmhandMenu menu, Farmer anyFarmer) =>
             // Locked the game's own way: its click handler refuses a row that "belongs to another player".
             new(menu, anyFarmer, 0) { NoRoom = true, _belongsToAnotherPlayer = true };
+
+        /// <summary>A made farmer that belongs to another ModRelay account: greyed and locked like another Steam player's, named as theirs.</summary>
+        public static Row Owned(FarmhandMenu menu, Farmer farmer, string owner) =>
+            new(menu, farmer, 0) { Owner = owner, _belongsToAnotherPlayer = true };
 
         private bool IsNew => !Farmer.isCustomized.Value;
 
@@ -175,10 +192,11 @@ internal static class JoinListTidy
         {
             if (!IsNew) { base.drawSlotDate(b, i); return; }
             var box = list.slotButtons[i].bounds;
-            Utility.drawTextWithShadow(b, JoinList.CabinsFree(Math.Max(freeCabins, 1)), Game1.dialogueFont, new Vector2(box.X + 128 + 32, box.Y + 64 + 40), Game1.textColor * getSlotAlpha());
+            Utility.drawTextWithShadow(b, JoinList.NewFarmerDetail(Farmer.farmName.Value), Game1.dialogueFont, new Vector2(box.X + 128 + 32, box.Y + 64 + 40), Game1.textColor * getSlotAlpha());
         }
 
-        // "Squeet Farm", not "Squeet Farm Farm".
-        protected override string slotSubName() => JoinList.FarmTitle(Farmer.farmName.Value, base.slotSubName());
+        // "Squeet Farm", not "Squeet Farm Farm". A farmer that belongs to another account says whose it is
+        // there instead (0.1.39: drawn over the farm's name it overlapped, the owner's screenshot of 13:14).
+        protected override string slotSubName() => Owner is not null ? JoinList.OwnedBy(Owner) : JoinList.FarmTitle(Farmer.farmName.Value, base.slotSubName());
     }
 }

@@ -37,6 +37,21 @@ public sealed class ModConfig
     /// </summary>
     public bool TidyJoinList { get; set; } = true;
     /// <summary>
+    /// Host (0.1.37). A player needs a ModRelay account in the farm's group to join at all: one
+    /// with no account (a game the launcher did not start, or a ticket that does not check out)
+    /// is disconnected with "this farm is private to its group". Null, the default, means yes on
+    /// a farm whose turn tracker has told it the group, and no otherwise. Whatever this says,
+    /// a farmer that belongs to another account is never anyone else's to play.
+    /// </summary>
+    public bool? RequireGroupAccount { get; set; }
+    /// <summary>
+    /// Host (0.1.40). Build a cabin for every group member who still has to make a farmer, so a
+    /// full farm never holds the day for somebody who cannot join it. The game's own safety
+    /// checks decide where: nothing anyone owns is cleared to make room. False leaves the farm
+    /// exactly as the host built it.
+    /// </summary>
+    public bool BuildCabinsForGroup { get; set; } = true;
+    /// <summary>
     /// Host only (0.1.29). While exactly one remote farmer is playing, their turn is saved by itself
     /// every this many minutes of farm time (a "Save my turn" nobody has to press: the player is
     /// held still for a moment, the farm is written, and they carry on). 0, the default, never.
@@ -102,6 +117,16 @@ public sealed class HelloMessage
 {
     public int Protocol { get; set; }
     public bool Enabled { get; set; }
+    /// <summary>0.1.37: who this player is, from the launcher's link file; the host checks the ticket (see JoinTicket). Null from a game the launcher did not start.</summary>
+    public string? AccountId { get; set; }
+    public string? AccountName { get; set; }
+    public string? Ticket { get; set; }
+}
+
+/// <summary>Host to a farmer just made (0.1.37): they are on today's roster now, and may play, leave or sit today out.</summary>
+public sealed class WelcomeMessage
+{
+    public string Date { get; set; } = "";
 }
 
 public sealed class StatusMessage
@@ -242,4 +267,6 @@ public sealed class RosterEntry
     public FarmerStatus Status { get; set; }
     public bool Online { get; set; }
     public bool InTurn { get; set; }
+    /// <summary>0.1.37: a group member with no farmer on the farm yet (Name reads "Pat (no farmer yet)"). Nobody can play it; it is waited for or skipped.</summary>
+    public bool Placeholder { get; set; }
 }

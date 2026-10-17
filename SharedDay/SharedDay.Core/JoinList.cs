@@ -74,6 +74,15 @@ public static class JoinList
     public static string CabinsFree(int count) => count == 1 ? "1 cabin free" : $"{Math.Max(count, 0)} cabins free";
 
     /// <summary>
+    /// The line under "Make a new farmer" (0.1.39). The owner, 2026-10-15: "cabins shouldnt matter": the
+    /// player is told what the row is, not how many cabins the host built.
+    /// </summary>
+    public static string NewFarmerDetail(string? farmName) => string.IsNullOrWhiteSpace(farmName) ? "Your own farmer on this farm" : $"Your own farmer on {farmName.Trim()}";
+
+    /// <summary>The line under a farmer that belongs to another ModRelay account (0.1.37): "Casey's farmer".</summary>
+    public static string OwnedBy(string owner) => owner.EndsWith('s') || owner.EndsWith('S') ? owner + "' farmer" : owner + "'s farmer";
+
+    /// <summary>
     /// The farm's name on a row. The game writes "{name} Farm" in its own language, which doubles
     /// the word for a farm already called "Squeet Farm". When the game's line is the name with a
     /// second "Farm" after it, the name alone is shown; anything else is the game's line untouched.

@@ -6,7 +6,7 @@ Two SMAPI mods for Stardew Valley 1.6 co-op:
 
 | Mod | What it does | Version | Nexus |
 |---|---|---|---|
-| [**Shared Day**](SharedDay/README.md) | Turn-based co-op: everyone plays the same farm day, one after another, then the farm moves on together. | 0.1.35 | [Main file](https://www.nexusmods.com/stardewvalley/mods/53757) |
+| [**Shared Day**](SharedDay/README.md) | Turn-based co-op: everyone plays the same farm day, one after another, then the farm moves on together. | 0.1.44 | [Main file](https://www.nexusmods.com/stardewvalley/mods/53757) |
 | [**Many Farms**](ManyFarms/README.md) | Several farms in one game: each player picks or starts a farm of their own, and a Farmstead Totem takes anyone to any of them. | 0.5.2 | [Optional file](https://www.nexusmods.com/stardewvalley/mods/53757?tab=files) |
 
 **Download:** [nexusmods.com/stardewvalley/mods/53757](https://www.nexusmods.com/stardewvalley/mods/53757), or the zips on the [Releases](https://github.com/CarbonNode/StardewMods/releases) page (the same files).
@@ -76,7 +76,7 @@ dotnet test ManyFarms/ManyFarms.Tests
 
 By squeetsquib. Bug reports and pull requests are welcome.
 
-The mods' SMAPI IDs stay `CarbonNode.SharedDay` and `CarbonNode.ManyFarms` (and their save-data keys keep that prefix): changing a UniqueID would break existing saves, update checks and the two mods' APIs. The released 0.1.35 / 0.5.2 zips still list the old author name; the next release carries `squeetsquib`.
+The mods' SMAPI IDs stay `CarbonNode.SharedDay` and `CarbonNode.ManyFarms` (and their save-data keys keep that prefix): changing a UniqueID would break existing saves, update checks and the two mods' APIs. The Shared Day 0.1.44 zip carries `squeetsquib`; the Many Farms 0.5.2 zip still lists the old author name and will change with its next release.
 
 ---
 

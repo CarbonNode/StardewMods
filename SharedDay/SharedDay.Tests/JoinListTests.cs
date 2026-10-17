@@ -147,3 +147,14 @@ public sealed class FarmWordsTests
             Assert.DoesNotContain(" farm farm", (" " + FarmWords.Bare(name) + " Farm").ToLowerInvariant());
     }
 }
+
+public sealed class JoinListWordsTests
+{
+    [Xunit.Fact]
+    public void TheNewFarmerRowSaysWhatItIsNotHowManyCabins()
+    {
+        Xunit.Assert.Equal("Your own farmer on Squeet Farm", SharedDay.Core.JoinList.NewFarmerDetail("Squeet Farm"));
+        Xunit.Assert.Equal("Your own farmer on this farm", SharedDay.Core.JoinList.NewFarmerDetail(null));
+        Xunit.Assert.Equal("M0SSLING's farmer", SharedDay.Core.JoinList.OwnedBy("M0SSLING"));
+    }
+}

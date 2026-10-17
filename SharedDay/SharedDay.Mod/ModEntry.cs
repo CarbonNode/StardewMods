@@ -94,6 +94,21 @@ public sealed class ModEntry : StardewModdingAPI.Mod
     // mods on a slow PC. Ten seconds disconnected exactly those players, so it is five minutes.
     private static readonly TimeSpan HelloGrace = TimeSpan.FromMinutes(5);
     private readonly Dictionary<long, DateTime> unadmittedSince = new();
+    /// <summary>Host (0.1.37): the checked ModRelay account of each connected player whose launcher started their game (see JoinTicket).</summary>
+    private readonly Dictionary<long, JoinAccount> joinAccounts = new();
+    /// <summary>
+    /// Host (0.1.41): a join ticket has been checked and passed on this farm, so the chain that
+    /// says who a player is works. Until then nobody is turned away for failing to prove it: a
+    /// broken launcher, link file or tracker must never lock a group out of its own farm.
+    /// </summary>
+    private bool ticketsProven;
+    /// <summary>Said once per load: the tracker answered with an empty group (0.1.41).</summary>
+    private bool groupEmptyLogged;
+    /// <summary>Players already let in unproven, so the log says it once each.</summary>
+    private readonly HashSet<long> unprovenAdmitted = new();
+    private bool sitOutConfirmQueued;
+    private bool welcomeQueued;
+    private string welcomeDate = "";
     private readonly Dictionary<long, string> rejectReasons = new();
     private readonly HashSet<long> rejectedPeers = new();
     // ---- 0.1.29: parked turns, owed nights, held saves, removal orders ----
@@ -160,6 +175,13 @@ public sealed class ModEntry : StardewModdingAPI.Mod
         ? status.Roster.All(r => r.Id == Game1.player.UniqueMultiplayerID || r.Status != FarmerStatus.Pending)
         : !status.WaitingFor.Any(n => n != Game1.player.Name));
     /// <summary>
+    /// This player is the only entry on today's roster (0.1.37): nobody else is waited for, so their
+    /// sleep or finish ends the day for the whole farm. Said plainly wherever the day is ended
+    /// (Squeet Farm, 2026-10-15: a lone farmer's two bedtimes took the farm from Spring 1 to Spring 3).
+    /// </summary>
+    private bool IsAloneOnRoster => status is not null && !Released && status.Roster.Length == 1
+        && status.Roster[0].Id == Game1.player.UniqueMultiplayerID && status.Roster[0].Status == FarmerStatus.Pending;
+    /// <summary>
     /// "Save my turn" is offered to a farmhand who is the only remote farmer on the farm and still
     /// playing, on a host that takes the request (0.1.29). A player's own game, never the host's.
     /// </summary>
@@ -188,6 +210,10 @@ public sealed class ModEntry : StardewModdingAPI.Mod
     internal const string RestartSeenKey = "CarbonNode.SharedDay/restartSeen";
     // 0.1.35: Troubleshooting, and "Give a farmer a fresh day" (see GiveFreshDay and FreshDayMark).
     private bool toolsQueued;
+    /// <summary>0.1.43: the "who plays which farmer" menu is wanted, and the member it is being answered for.</summary>
+    private bool whoQueued;
+    private string? whoFor;
+    private (string MemberId, string MemberName, long FarmerId, string FarmerName)? whoConfirm;
     private bool toolsPasswordQueued;
     private long? freshConfirmFor;
     /// <summary>The farm's password as this player typed it for Troubleshooting, kept for the day so each tool does not ask again.</summary>
@@ -349,7 +375,7 @@ public sealed class ModEntry : StardewModdingAPI.Mod
         // A farm AutoHost loaded has nobody to press OK on the night's menus; see HostAutopilot.
         autopilot = new HostAutopilot(helper, Monitor, () => Unattended, () => waitingMenu);
         helper.Events.Specialized.UnvalidatedUpdateTicked += autopilot.OnUpdateTicked;
-        helper.ConsoleCommands.Add("shared_day", "Shared Day: status | skip <farmer> | reopen <farmer> | unskip <farmer> | fresh_day <farmer> | bar <farmer> | unbar <farmer> | free_cabin <farmer> | mode Relay|Together | checkpoint | retry | restart_day", OnCommand);
+        helper.ConsoleCommands.Add("shared_day", "Shared Day: status | skip <farmer> | skip_rest | reopen <farmer> | unskip <farmer> | fresh_day <farmer> | bar <farmer> | unbar <farmer> | free_cabin <farmer> | owner <farmer> <account id> [name] | disown <farmer> | mode Relay|Together | checkpoint | retry | restart_day", OnCommand);
     }
 
     private void OnLaunched(object? sender, GameLaunchedEventArgs e)
@@ -358,7 +384,7 @@ public sealed class ModEntry : StardewModdingAPI.Mod
         ConfigMenu.Register(Helper, ModManifest, () => Config, () => Helper.WriteConfig(Config), Monitor);
         // The join screen is tidied whether or not the relay is enabled, like the Join button: it
         // changes only what this PC draws.
-        JoinListTidy.Install(new Harmony(ModManifest.UniqueID), Monitor, () => Config.TidyJoinList);
+        JoinListTidy.Install(new Harmony(ModManifest.UniqueID), Monitor, () => Config.TidyJoinList, JoinListOwners);
         // Many Farms is optional and so is its API: one too old to have it leaves this null.
         try { farms = Helper.ModRegistry.GetApi<IManyFarmsApi>("CarbonNode.ManyFarms"); }
         catch (Exception ex) { Monitor.Log("Shared Day could not read Many Farms' API and offers no farm choice in its menu. " + ex.Message, LogLevel.Warn); }
@@ -399,8 +425,34 @@ public sealed class ModEntry : StardewModdingAPI.Mod
         return all.Select(f => new FarmerIdentity(f.UniqueMultiplayerID, f.Name));
     }
 
+    /// <summary>
+    /// One line for the ModRelay launcher, which reads SMAPI's log when the game closes and when
+    /// the launcher starts: which farmer this PC played, on which farm. It is how a player who
+    /// joined from the game's own co-op screen, never the launcher, is still enrolled there
+    /// ("I'm playing as", the You tags, turn reminders) without picking a farmer by hand. The farm
+    /// is named by the id the host reports to the turn tracker (<c>Game1.uniqueIDForThisGame</c>,
+    /// which a farmhand receives with the world) and by SMAPI's save folder name as a second
+    /// witness. The launcher parses the wording (<c>Playing as NAME (ID) on farm FARMID</c>):
+    /// change it and the launcher together.
+    /// </summary>
+    private void LogWhoIAm()
+    {
+        try
+        {
+            var me = Game1.player;
+            if (me is null) return;
+            string farm = Game1.MasterPlayer?.farmName.Value ?? me.farmName.Value ?? "";
+            Monitor.Log($"Playing as {me.Name} ({me.UniqueMultiplayerID}) on farm {Game1.uniqueIDForThisGame} \"{farm}\" ({Constants.SaveFolderName ?? "?"}).", LogLevel.Info);
+        }
+        catch (Exception ex)
+        {
+            Monitor.Log($"Could not say which farmer this is: {ex.Message}", LogLevel.Trace);
+        }
+    }
+
     private void OnLoaded(object? sender, SaveLoadedEventArgs e)
     {
+        LogWhoIAm();
         // A disabled client still announces itself, so an enabled host can turn it away
         // at once instead of waiting out the hello grace. A vanilla host ignores this.
         if (!Config.Enabled && Context.IsWorldReady && !Context.IsMainPlayer) { SendHello(); return; }
@@ -426,6 +478,9 @@ public sealed class ModEntry : StardewModdingAPI.Mod
         if (!Context.IsMainPlayer) { SendHello(); return; }
         barred = Barring.Read();
         newFarmersAllowed = Barring.ReadNewFarmers();
+        ticketsProven = false;
+        groupEmptyLogged = false;
+        unprovenAdmitted.Clear();
         freeCabinFailed.Clear();
         resumedOwnClock.Clear();
         freshDayDue.Clear();
@@ -626,6 +681,14 @@ public sealed class ModEntry : StardewModdingAPI.Mod
             Monitor.Log(message, LogLevel.Info);
             Game1.addHUDMessage(new HUDMessage(message));
             notifier.Joined(FarmName, ShortDate(), farmer.Name);
+            // 0.1.37: the farmer belongs to the account whose launcher made it, and that player is told their three ways on.
+            if (joinAccounts.TryGetValue(id, out var account) && Ownership.Set(farmer, account.Id, account.Name))
+            {
+                Monitor.Log($"{farmer.Name} belongs to {account.Name} (ModRelay account {account.Id}).", LogLevel.Info);
+                // Their placeholder, if they had one, goes now rather than at the tracker's next answer.
+                if (coordinator.Group.Count > 0) coordinator.SetGroup(WithOwnedFarmers(coordinator.Group));
+            }
+            Helper.Multiplayer.SendMessage(new WelcomeMessage { Date = ShortDate() }, "welcome", new[] { ModManifest.UniqueID }, new[] { id });
             return true;
         }
         catch (DayCoordinationException ex)
@@ -640,6 +703,7 @@ public sealed class ModEntry : StardewModdingAPI.Mod
         if (error is not null || coordinator is null || !IsRequired(id)) return;
         try
         {
+            ClaimOnJoin(id);
             var before = coordinator.Snapshot.Farmers.FirstOrDefault(f => f.Id == id);
             bool wasAway = before is { Away: true };
             bool wasInTurn = before is { IsInCurrentSession: true };
@@ -816,6 +880,7 @@ public sealed class ModEntry : StardewModdingAPI.Mod
         unadmittedSince.Remove(e.Peer.PlayerID);
         rejectReasons.Remove(e.Peer.PlayerID);
         rejectedPeers.Remove(e.Peer.PlayerID);
+        joinAccounts.Remove(e.Peer.PlayerID);
         if (IsRequired(e.Peer.PlayerID))
         {
             // An unfinished turn is parked at this clock, and the spot they stood on kept with it.
@@ -902,6 +967,18 @@ public sealed class ModEntry : StardewModdingAPI.Mod
                     Broadcast();
                     return;
                 }
+                // 0.1.37: who they are, and whether the farmer they picked is theirs to play.
+                var account = CheckedAccount(hello);
+                if (account is not null) joinAccounts[e.FromPlayerID] = account; else joinAccounts.Remove(e.FromPlayerID);
+                if (OwnershipRefusal(e.FromPlayerID, account) is { } why)
+                {
+                    incompatiblePeers.Add(e.FromPlayerID);
+                    rejectReasons[e.FromPlayerID] = why;
+                    Monitor.Log($"Turning away {NameOf(e.FromPlayerID)}: {why}.", LogLevel.Warn);
+                    KickLater(e.FromPlayerID, char.ToUpperInvariant(why[0]) + why[1..] + ".");
+                    Broadcast();
+                    return;
+                }
                 if (!IsRequired(e.FromPlayerID) && !CanJoinAsNewFarmer(e.FromPlayerID)) { Broadcast(); return; }
                 incompatiblePeers.Remove(e.FromPlayerID);
                 pendingJoins.Add(e.FromPlayerID);
@@ -953,6 +1030,7 @@ public sealed class ModEntry : StardewModdingAPI.Mod
                     else GiveFreshDay(e.FromPlayerID, fix.Target);
                 }
                 else if (error is not null || coordinator is null || incompatiblePeers.Contains(e.FromPlayerID)) return;
+                else if (fix.Kind == "sitout") SitOut(e.FromPlayerID);
                 else if (fix.Kind is "joinnow" or "wait") AnswerReturnChoice(e.FromPlayerID, fix.Kind);
                 else if (fix.Kind == "savenow") BeginHeldSave(e.FromPlayerID, byRequest: true);
                 else ApplyFix(e.FromPlayerID, fix);
@@ -986,6 +1064,12 @@ public sealed class ModEntry : StardewModdingAPI.Mod
                 if (Game1.activeClickableMenu is NotesMenu notes) notes.Refused(reason);
                 else Game1.addHUDMessage(new HUDMessage(reason) { noIcon = true });
             }
+        }
+        else if (e.Type == "welcome" && e.FromPlayerID == Game1.MasterPlayer.UniqueMultiplayerID)
+        {
+            // Just made a farmer here (0.1.37): play the day, leave for now, or sit it out.
+            welcomeDate = (e.ReadAs<WelcomeMessage>().Date ?? "").Trim();
+            welcomeQueued = true;
         }
         else if (e.Type == "note" && e.FromPlayerID == Game1.MasterPlayer.UniqueMultiplayerID)
         {
@@ -1045,7 +1129,257 @@ public sealed class ModEntry : StardewModdingAPI.Mod
             unadmittedSince.Remove(id);
     }
 
-    private void SendHello() => Helper.Multiplayer.SendMessage(new HelloMessage { Protocol = ProtocolVersion, Enabled = Config.Enabled }, "hello", new[] { ModManifest.UniqueID }, new[] { Game1.MasterPlayer.UniqueMultiplayerID });
+    private void SendHello()
+    {
+        // Who this player is, from the launcher's link file (0.1.37). A game the launcher did not start says nothing.
+        var link = Hub?.Link;
+        Helper.Multiplayer.SendMessage(new HelloMessage
+        {
+            Protocol = ProtocolVersion, Enabled = Config.Enabled,
+            AccountId = link?.AccountId, AccountName = link?.AccountName, Ticket = link?.Ticket
+        }, "hello", new[] { ModManifest.UniqueID }, new[] { Game1.MasterPlayer.UniqueMultiplayerID });
+    }
+
+    // ---- 0.1.37: whose farmer is whose ----
+
+    /// <summary>The joining player's account, when their ticket checks out against this farm's tracker token; else null (and the log says why once per hello).</summary>
+    private JoinAccount? CheckedAccount(HelloMessage hello)
+    {
+        if (string.IsNullOrWhiteSpace(hello.AccountId)) return null;
+        string? trackerId = JoinTicket.TrackerIdOf(Config.TurnTracker.Url);
+        if (JoinTicket.Verify(trackerId, Config.TurnTracker.Token, hello.AccountId, hello.AccountName, hello.Ticket, DateTimeOffset.UtcNow))
+        {
+            // The chain works. From now on this farm holds everyone to it (see FarmerOwnership.Refusal).
+            if (!ticketsProven)
+            {
+                ticketsProven = true;
+                Monitor.Log("A join ticket checked out: this farm can tell who its players are, and from now on it turns away anyone who cannot say.", LogLevel.Info);
+            }
+            return new JoinAccount(hello.AccountId.Trim(), string.IsNullOrWhiteSpace(hello.AccountName) ? "A player" : hello.AccountName.Trim());
+        }
+        Monitor.Log(trackerId is null || string.IsNullOrEmpty(Config.TurnTracker.Token)
+            ? $"A player says they are ModRelay account {hello.AccountName ?? hello.AccountId}, but this host has no turn tracker to check that with; they count as having no account."
+            : $"A player says they are ModRelay account {hello.AccountName ?? hello.AccountId}, but their join ticket does not check out (expired, or for another farm); they count as having no account.", LogLevel.Warn);
+        return null;
+    }
+
+    /// <summary>Why the player who just said hello may not play the farmer they picked, or null.</summary>
+    private string? OwnershipRefusal(long id, JoinAccount? account)
+    {
+        var farmer = Game1.getOnlineFarmers().FirstOrDefault(f => f.UniqueMultiplayerID == id);
+        var (ownerId, ownerName) = farmer is null || farmer.isUnclaimedFarmhand ? (null, null) : Ownership.Of(farmer);
+        var group = coordinator?.Group ?? Array.Empty<GroupMember>() as IReadOnlyList<GroupMember>;
+        bool require = Config.RequireGroupAccount ?? group.Count > 0;
+        // The owner's own word in config.json is taken as proof enough; otherwise a ticket has to
+        // have been seen to work on this farm first (0.1.41).
+        bool proven = ticketsProven || Config.RequireGroupAccount == true;
+        string name = farmer is { isUnclaimedFarmhand: false } && !string.IsNullOrWhiteSpace(farmer.Name) ? farmer.Name : "That farmer";
+        string? refusal = FarmerOwnership.Refusal(name, ownerId, ownerName ?? MemberName(ownerId), account, require, group.Count > 0 ? group.Select(m => m.AccountId) : null, proven);
+        if (refusal is null && account is null && !proven && (ownerId is not null || require) && unprovenAdmitted.Add(id))
+            Monitor.Log(FarmerOwnership.NotProven(NameOf(id)), LogLevel.Warn);
+        return refusal;
+    }
+
+    private string? MemberName(string? accountId) => accountId is null ? null : coordinator?.Group.FirstOrDefault(m => m.AccountId == accountId)?.Name;
+
+    /// <summary>
+    /// A player whose ticket checked out, joining a farmer nobody owns yet, takes it as theirs
+    /// (0.1.42). Without this a farmer made before 0.1.37, or on a launcher that never picked one,
+    /// stays ownerless for ever: the roster then has to guess by counting, and the farm can end up
+    /// waiting on a person twice, once as their farmer and once as a member with "no farmer yet"
+    /// (the owner, 2026-10-15: "and what about duplicates of same person?", of MOSS and M0SSLING).
+    /// A farmer that already belongs to somebody is never taken this way.
+    /// </summary>
+    private void ClaimOnJoin(long id)
+    {
+        if (!Context.IsMainPlayer || coordinator is null) return;
+        if (!joinAccounts.TryGetValue(id, out var account)) return;
+        var farmer = Game1.getAllFarmers().FirstOrDefault(f => f.UniqueMultiplayerID == id);
+        if (farmer is null || farmer.isUnclaimedFarmhand || farmer.IsMainPlayer) return;
+        if (Ownership.Of(farmer).Id is not null) return;
+        if (!Ownership.Set(farmer, account.Id, account.Name)) return;
+        checkpointPending = true;
+        Monitor.Log($"{farmer.Name} belongs to {account.Name} (ModRelay account {account.Id}): they joined as that farmer.", LogLevel.Info);
+        RefreshOwners();
+        if (coordinator.Group.Count > 0)
+        {
+            try { coordinator.SetGroup(WithOwnedFarmers(coordinator.Group)); }
+            catch (EmptyGroupException) { }
+        }
+    }
+
+    /// <summary>Tells the day which account each farmer belongs to, so one person never holds it twice (0.1.42).</summary>
+    private void RefreshOwners()
+    {
+        if (coordinator is null) return;
+        coordinator.FarmerOwners.Clear();
+        foreach (var farmer in Game1.getAllFarmers())
+        {
+            if (farmer.isUnclaimedFarmhand) continue;
+            if (Ownership.Of(farmer).Id is { } owner) coordinator.FarmerOwners[farmer.UniqueMultiplayerID] = owner;
+        }
+    }
+
+    /// <summary>
+    /// One person, one place on the roster (0.1.42). A member with more than one farmer here holds
+    /// the day with the one they are playing (or played); the rest sit the day out by themselves,
+    /// as a farmer the farm has stopped waiting for does, and are back the moment they are played.
+    /// </summary>
+    private void SitOutSpareFarmers()
+    {
+        if (!Context.IsMainPlayer || coordinator is null || error is not null) return;
+        var day = coordinator.Snapshot;
+        if (day.Phase != DayPhase.Open) return;
+        RefreshOwners();
+        foreach (string account in coordinator.FarmerOwners.Values.Distinct().ToArray())
+        {
+            foreach (long spare in coordinator.SpareFarmersOf(account))
+            {
+                var farmer = day.Farmers.FirstOrDefault(f => f.Id == spare);
+                if (farmer is null || farmer.Status != FarmerStatus.Pending || farmer.IsOnline) continue;
+                try
+                {
+                    if (!coordinator.StepAway(spare)) continue;
+                    checkpointPending = true;
+                    Monitor.Log($"{farmer.Name} is another farmer of {MemberName(account) ?? account}, who is already on today's roster, so the farm does not wait for both. {farmer.Name} plays again the moment somebody is on them.", LogLevel.Info);
+                }
+                catch (DayCoordinationException) { }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Everyone still to play today sits it out, in one go (0.1.42). The owner, 2026-10-15: "ability to
+    /// skip days without everyone?". The host's own skip, one name at a time, is slow when a farm
+    /// waits on several; this does the lot, so the night runs tonight. Nobody loses anything and
+    /// everyone plays tomorrow.
+    /// </summary>
+    /// <returns>How many were sat out.</returns>
+    private int SkipTheRestOfToday(string by)
+    {
+        if (!Context.IsMainPlayer || coordinator is null || error is not null) return 0;
+        var day = coordinator.Snapshot;
+        if (day.Phase != DayPhase.Open) return 0;
+        long me = Game1.player.UniqueMultiplayerID;
+        // A farmer somebody is on right now is playing: they are not skipped from under them.
+        var rest = day.Farmers.Where(f => f.Status == FarmerStatus.Pending && !f.IsOnline && f.Id != me).ToArray();
+        int done = 0;
+        foreach (var farmer in rest)
+        {
+            try { if (coordinator.Skip(farmer.Id)) done++; }
+            catch (DayCoordinationException ex) { Monitor.Log($"Could not skip {farmer.Name}: {ex.Message}", LogLevel.Warn); }
+        }
+        if (done > 0)
+        {
+            checkpointPending = true;
+            string names = NameList(rest.Select(f => f.Name).ToArray());
+            string message = $"{names} sit {ShortDate()} out, by {by}. Nothing of theirs is lost and they play tomorrow.";
+            Monitor.Log(message, LogLevel.Info);
+            Game1.addHUDMessage(new HUDMessage(message));
+            foreach (var farmer in rest) notifier.Skipped(FarmName, ShortDate(), farmer.Name);
+            Broadcast();
+        }
+        return done;
+    }
+
+    /// <summary>Farmers a "skip the rest of today" would sit out right now.</summary>
+    private IEnumerable<RosterEntry> RestOfToday() => status is null || Released || status.Error is not null
+        ? Enumerable.Empty<RosterEntry>()
+        : status.Roster.Where(r => r.Status == FarmerStatus.Pending && !r.Online && r.Id != Game1.player.UniqueMultiplayerID);
+
+    /// <summary>The group with the farm's own ownership records filled in: a member who owns a farmer here is matched to it, pick or no pick.</summary>
+    private static List<GroupMember> WithOwnedFarmers(IEnumerable<GroupMember> members) =>
+        GroupMember.WithOwnedFarmers(members, Game1.getAllFarmers().Where(f => !f.IsMainPlayer && !f.isUnclaimedFarmhand)
+            .Select(f => (f.UniqueMultiplayerID, Ownership.Of(f).Id)).Where(p => p.Id is not null).Select(p => (p.UniqueMultiplayerID, p.Id!)));
+
+    private string NameOf(long id) => Game1.getAllFarmers().FirstOrDefault(f => f.UniqueMultiplayerID == id)?.Name is { Length: > 0 } n ? n : id.ToString();
+
+    /// <summary>Whose farmer each farmer is, for the tracker's report.</summary>
+    private (string? Id, string? Name) OwnerOf(long id)
+    {
+        var (owner, name) = Ownership.Of(Game1.getAllFarmers().FirstOrDefault(f => f.UniqueMultiplayerID == id));
+        return (owner, name ?? MemberName(owner));
+    }
+
+    /// <summary>
+    /// The group's picks ("I'm playing as", a claim in the launcher, or the launcher's enrolment from
+    /// the game's log) become the farmers' owners. A farmer already recorded as somebody else's keeps
+    /// its owner: the host's own record stands, and the server refuses such a claim anyway.
+    /// </summary>
+    private void AdoptOwners(IReadOnlyList<GroupMember> members)
+    {
+        foreach (var member in members)
+        {
+            if (member.FarmerId is not { } farmerId) continue;
+            var farmer = Game1.getAllFarmers().FirstOrDefault(f => f.UniqueMultiplayerID == farmerId);
+            if (farmer is null || farmer.isUnclaimedFarmhand || farmer.IsMainPlayer) continue;
+            var (owner, _) = Ownership.Of(farmer);
+            if (owner is not null && owner != member.AccountId)
+            {
+                Monitor.Log($"The group says {member.Name} plays {farmer.Name}, but {farmer.Name} belongs to {MemberName(owner) ?? owner} here; the farm's own record stands.", LogLevel.Warn);
+                continue;
+            }
+            if (Ownership.Set(farmer, member.AccountId, member.Name))
+            {
+                checkpointPending = true;
+                Monitor.Log($"{farmer.Name} belongs to {member.Name} (ModRelay account {member.AccountId}): the group says so.", LogLevel.Info);
+            }
+            RefreshOwners();
+        }
+    }
+
+    /// <summary>What the game's join screen on a player's PC greys out: the farmers that belong to other accounts, by this player's own account.</summary>
+    private (string? Me, IReadOnlyDictionary<long, string> Owners) JoinListOwners()
+    {
+        var owners = new Dictionary<long, string>();
+        if (Hub?.Farm is { } farm)
+            foreach (var f in farm.Farmers)
+                if (!f.Placeholder && f.OwnerId is not null && long.TryParse(f.Id, out long id) && f.OwnerId != Hub.Link.AccountId)
+                    owners[id] = f.OwnerName ?? "another player";
+        return (Hub?.Link.AccountId, owners);
+    }
+
+    /// <summary>A farmer sits today out at their own request (0.1.37, "Sit today out"): no vote, nothing lost, back tomorrow.</summary>
+    private void SitOut(long id)
+    {
+        if (coordinator is null || error is not null) return;
+        var farmer = coordinator.Snapshot.Farmers.FirstOrDefault(f => f.Id == id);
+        if (farmer is null || farmer.Status != FarmerStatus.Pending) return;
+        SkipFarmer(id);
+        Tell(id, $"You sit {ShortDate()} out. Nothing is lost, and you play again tomorrow. The others don't wait for you today.");
+    }
+
+    private void RequestSitOut()
+    {
+        if (Context.IsMainPlayer) SitOut(Game1.player.UniqueMultiplayerID);
+        else Helper.Multiplayer.SendMessage(new FixRequest { Day = status?.Day ?? Game1.Date.TotalDays, Kind = "sitout", Target = Game1.player.UniqueMultiplayerID }, "fix", new[] { ModManifest.UniqueID }, new[] { Game1.MasterPlayer.UniqueMultiplayerID });
+    }
+
+    private bool CanSitOut => CanFinishLocal && status is not null && status.Roster.Any(r => r.Id == Game1.player.UniqueMultiplayerID && r.Status == FarmerStatus.Pending);
+
+    private void ShowSitOutConfirm()
+    {
+        if (!CanSitOut || Game1.activeClickableMenu is not null) return;
+        AskQuestion($"Sit {ShortDate()} out? Your turn ends without playing. Nothing is lost, you play again tomorrow, and the others don't wait for you today."
+            + (IsAloneOnRoster ? $" You are the only farmer on today's roster, so this ends {ShortDate()} for the whole farm." : ""),
+            new[] { new Response("keep", "Keep my turn"), new Response("sitout", "Sit today out") },
+            (_, answer) => { if (answer == "sitout") RequestSitOut(); });
+    }
+
+    /// <summary>The three ways on from a farmer just made (0.1.37, the owner: "need a way to join farm without having to join and start day").</summary>
+    private void ShowWelcome()
+    {
+        if (Game1.activeClickableMenu is not null || status is null || Released) return;
+        string date = string.IsNullOrEmpty(welcomeDate) ? ShortDate() : welcomeDate;
+        AskQuestion($"Your farmer is on {FarmName} now, and you are on {date}'s roster. The day waits for you until you play it or sit it out; it cannot end without you. Leaving keeps your turn open for later."
+            + (IsAloneOnRoster ? " You are the only farmer on today's roster, so going to bed would end the day for the whole farm." : ""),
+            new[] { new Response("play", "Play my day now"), new Response("leave", "Leave for now"), new Response("sitout", "Sit today out") },
+            (_, answer) =>
+            {
+                if (answer == "leave") { SendHealth(force: true); Game1.ExitToTitle(null); }
+                if (answer == "sitout") RequestSitOut();
+            });
+    }
 
     internal void RequestFinish()
     {
@@ -1129,6 +1463,12 @@ public sealed class ModEntry : StardewModdingAPI.Mod
             toolsPasswordQueued = false;
             AskToolsPassword();
         }
+        if (whoQueued && Game1.activeClickableMenu is null)
+        {
+            whoQueued = false;
+            ShowWhoMenu();
+        }
+        if (whoConfirm is not null && Game1.activeClickableMenu is null) ShowWhoConfirm();
         if (toolsQueued && Game1.activeClickableMenu is null)
         {
             toolsQueued = false;
@@ -1176,6 +1516,16 @@ public sealed class ModEntry : StardewModdingAPI.Mod
             farmPickerQueued = false;
             OpenFarmPicker();
         }
+        if (sitOutConfirmQueued && Game1.activeClickableMenu is null)
+        {
+            sitOutConfirmQueued = false;
+            ShowSitOutConfirm();
+        }
+        if (welcomeQueued && Game1.activeClickableMenu is null && status is not null)
+        {
+            welcomeQueued = false;
+            ShowWelcome();
+        }
         if (finishConfirmQueued && Game1.activeClickableMenu is null)
         {
             finishConfirmQueued = false;
@@ -1195,7 +1545,7 @@ public sealed class ModEntry : StardewModdingAPI.Mod
                 int furthest = calendarClock.HighWaterMinute;
                 // One farmer's face a second, only while a tracker wants them.
                 if (tracker.WantsPortraits) portraits.CaptureOne(coordinator.Snapshot.Farmers.Select(f => f.Id));
-                tracker.Update(coordinator.Snapshot, coordinator.Snapshot.Mode, furthest / 60 * 100 + furthest % 60, error, portraits.For);
+                tracker.Update(coordinator.Snapshot, coordinator.Snapshot.Mode, furthest / 60 * 100 + furthest % 60, error, portraits.For, OwnerOf);
             }
             if (e.IsMultipleOf(60))
             {
@@ -1209,6 +1559,8 @@ public sealed class ModEntry : StardewModdingAPI.Mod
             TickKicks();
             ApplyTrackerOrders();
             if (e.IsMultipleOf(60)) FreeBarredCabins();
+            if (e.IsMultipleOf(60)) EnsureCabins();
+            if (e.IsMultipleOf(60)) SitOutSpareFarmers();
             PromoteWaiters();
             ExpireNightHolds();
             TickHeldSave();
@@ -1475,7 +1827,9 @@ public sealed class ModEntry : StardewModdingAPI.Mod
         bypassDay = -1;
         bypassQueued = false;
         restartConfirmQueued = restartPasswordQueued = false;
-        toolsQueued = toolsPasswordQueued = false;
+        toolsQueued = toolsPasswordQueued = whoQueued = false;
+        whoFor = null;
+        whoConfirm = null;
         freshConfirmFor = null;
         toolsSecret = null;
         toolsDay = -1;
@@ -1504,7 +1858,7 @@ public sealed class ModEntry : StardewModdingAPI.Mod
         emptyTicks = 0;
         announcedTurn = null;
         lastSentHealth = -1;
-        skipMenuQueued = finishConfirmQueued = false;
+        skipMenuQueued = finishConfirmQueued = sitOutConfirmQueued = welcomeQueued = false;
         TurnHud.Reset();
         barred = new HashSet<long>();
         newFarmersAllowed = true;
@@ -1563,7 +1917,7 @@ public sealed class ModEntry : StardewModdingAPI.Mod
             FinishedNames = s.Farmers.Where(f => f.Status == FarmerStatus.Completed).Select(f => f.Name).ToArray(),
             SkippedNames = s.Farmers.Where(f => f.Status == FarmerStatus.Skipped && !f.Away).Select(f => f.Name).ToArray(),
             AwayNames = s.Farmers.Where(f => f.Away).Select(f => f.Name).ToArray(),
-            Roster = s.Farmers.Select(f => new RosterEntry { Id = f.Id, Name = f.Name, Status = f.Status, Online = f.IsOnline, InTurn = f.IsInCurrentSession }).ToArray(),
+            Roster = s.Farmers.Select(f => new RosterEntry { Id = f.Id, Name = f.Name, Status = f.Status, Online = f.IsOnline, InTurn = f.IsInCurrentSession, Placeholder = f.IsPlaceholder }).ToArray(),
             SkipVotes = SkipVoteEntries(s),
             BypassSalt = BypassCode.IsSet(Config.Bypass.Hash) ? Config.Bypass.Salt : null,
             BypassHash = BypassCode.IsSet(Config.Bypass.Hash) ? Config.Bypass.Hash : null,
@@ -1684,7 +2038,8 @@ public sealed class ModEntry : StardewModdingAPI.Mod
             lines.Add($"{date}: it's your turn.");
             if (played.Length > 0) lines.Add($"Already played this day: {played}.");
             if (others.Length > 0) lines.Add($"Still to play: {others}.");
-            if (IsLastToPlay) lines.Add($"You are the last to play {date}. When you finish, the night runs for everyone.");
+            if (IsAloneOnRoster) lines.Add($"You are the only farmer on today's roster. When you finish or go to bed, {date} ends for the whole farm.");
+            else if (IsLastToPlay) lines.Add($"You are the last to play {date}. When you finish, the night runs for everyone.");
             lines.Add("Go to bed, or choose Finish my day, when you're done.");
         }
         else lines.Add(others.Length > 0 ? $"Waiting for {others} to play {date}." : $"Waiting for {date} to end.");
@@ -1841,6 +2196,7 @@ public sealed class ModEntry : StardewModdingAPI.Mod
                 choices.Add(new Response("joinnow", $"Join {NameList(choice.Playing)} now instead ({DayClock.Words(choice.TheirTime)})"));
         }
         if (CanSaveTurn) choices.Add(new Response("savenow", "Save my turn"));
+        if (CanSitOut) choices.Add(new Response("sitout", "Sit today out"));
         if (Context.IsMainPlayer && !Released && error is null && SkippableFarmers().Any())
             choices.Add(new Response("skip", "Skip someone's turn today"));
         else if (VotableFarmers().Any())
@@ -1866,6 +2222,7 @@ public sealed class ModEntry : StardewModdingAPI.Mod
             if (answer == "finish") finishConfirmQueued = true;
             if (answer is "joinnow" or "wait") SendReturnChoice(answer);
             if (answer == "savenow") RequestSaveTurn();
+            if (answer == "sitout") sitOutConfirmQueued = true;
             if (answer == "skip") skipMenuQueued = true;
             if (answer == "fix") fixMenuQueued = true;
             if (answer == "tools") { if (ToolsUnlocked) toolsQueued = true; else toolsPasswordQueued = true; }
@@ -1900,6 +2257,7 @@ public sealed class ModEntry : StardewModdingAPI.Mod
                     "joinnow" => "Join now",
                     "wait" => "Wait",
                     "savenow" => "Save my turn",
+                    "sitout" => "Sit today out",
                     "close" => "Keep playing / Keep waiting",
                     "skip" => helpVoting ? "Vote to skip someone today" : "Skip someone's turn today",
                     "fix" => "Fix a problem",
@@ -1919,12 +2277,13 @@ public sealed class ModEntry : StardewModdingAPI.Mod
                 "finish" => $"Finish my day ends your turn for {date}, the same as going to bed. Everything you did stays, and you play again when the next day starts.",
                 "joinnow" => "Join now puts you into the turn being played, at its clock. The hours between where you left your turn and now are gone for you; your day ends at 2:00 AM with everyone else's.",
                 "wait" => "Wait holds you here until the turn being played has ended. Then the clock goes back to where you left your turn and you carry on alone, losing nothing.",
+                "sitout" => "Sit today out ends your turn for this date without playing it: no vote is needed, nothing is lost, and you play again tomorrow. The others stop waiting for you today.",
                 "savenow" => "Save my turn writes the farm now, with you where you stand and the clock where it is, so a host that goes down loses none of your turn. Everyone on the farm holds still for a moment.",
                 "close" => "Keep playing, or Keep waiting, just closes this box. Nothing changes.",
                 "skip" when helpVoting => "Vote to skip lets the day end without a farmer who is offline and has not played. It passes when more than half of the other farmers vote for it. They lose nothing and play again tomorrow.",
                 "skip" => "Skip lets the day end without a farmer who is offline and has not played. They lose nothing and play again tomorrow.",
                 "fix" => "Fix a problem undoes a finish made by mistake, brings a skipped farmer back into today, or gets you unstuck. With the farm's password it can also restart today for everyone, from 6:00 AM in bed. Nothing is taken away.",
-                "tools" => "Troubleshooting is for the host, or whoever has the farm's password. It can give one farmer a fresh day (6:00 AM again, in bed, while everyone else carries on) or restart today for everyone. The villagers go back to their morning; nothing anyone owns or did is put back.",
+                "tools" => "Troubleshooting is for the host, or whoever has the farm's password. It can give one farmer a fresh day (6:00 AM again, in bed, while everyone else carries on), restart today for everyone, or say who plays which farmer when the farm is waiting for the same person twice. The villagers go back to their morning; nothing anyone owns or did is put back.",
                 "farm" => FarmPickerHelp(),
                 _ => "Disconnect leaves the farm for the title screen. A turn you have not finished stays open, and the others wait for you."
             };
@@ -1958,7 +2317,8 @@ public sealed class ModEntry : StardewModdingAPI.Mod
     {
         if (!CanFinishLocal || Game1.activeClickableMenu is not null) return;
         AskQuestion($"Finish {ShortDate()} now? You can't play again until the next day starts. Everything you did stays on the farm."
-            + (IsLastToPlay ? $" You are the last to play {ShortDate()}. When you finish, the night runs for everyone." : ""),
+            + (IsAloneOnRoster ? $" You are the only farmer on today's roster, so this ends {ShortDate()} for the whole farm."
+                : IsLastToPlay ? $" You are the last to play {ShortDate()}. When you finish, the night runs for everyone." : ""),
             new[] { new Response("keep", "Keep playing"), new Response("finish", "Finish my day") },
             (_, answer) => { if (answer == "finish") RequestFinish(); });
     }
@@ -1975,6 +2335,9 @@ public sealed class ModEntry : StardewModdingAPI.Mod
             ? VotableFarmers().Select(v => new Response("skip:" + v.Id, $"Vote to skip {v.Name} today ({v.Votes} of {v.Needed} so far)")).ToList()
             : SkippableFarmers().Select(f => new Response("skip:" + f.Id, $"Skip {f.Name} today")).ToList();
         if (choices.Count == 0 || Game1.activeClickableMenu is not null) return;
+        // 0.1.42: the lot in one go, so a farm waiting on several does not take several answers.
+        // The owner, 2026-10-15: "ability to skip days without everyone?".
+        if (!voting && RestOfToday().Count() > 1) choices.Add(new Response("skip:rest", $"Skip everyone still waiting ({RestOfToday().Count()})"));
         choices.Add(new Response("back", "Back"));
         waitingMenuSelection = null;
         waitingMenuDescription = Describe();
@@ -1986,7 +2349,8 @@ public sealed class ModEntry : StardewModdingAPI.Mod
                 + (voting ? " It passes when more than half of the other farmers vote for it." : ""),
             choices.ToArray(), (_, answer) =>
             {
-                if (answer.StartsWith("skip:", StringComparison.Ordinal) && long.TryParse(answer[5..], out long id))
+                if (answer == "skip:rest") SkipTheRestOfToday("the host");
+                else if (answer.StartsWith("skip:", StringComparison.Ordinal) && long.TryParse(answer[5..], out long id))
                 {
                     if (!voting) SkipFarmer(id);
                     else if (status is not null)
@@ -2450,13 +2814,113 @@ public sealed class ModEntry : StardewModdingAPI.Mod
     /// The host's repairs: a fresh day for any farmer on today's roster, or today again for
     /// everyone. Each asks once more, naming who it moves, before anything happens.
     /// </summary>
+    /// <summary>Today's roster as the local game knows it, for the menus (0.1.43).</summary>
+    private IReadOnlyList<FarmerSnapshot> RosterSnapshot() => Context.IsMainPlayer && coordinator is not null && error is null
+        ? coordinator.Snapshot.Farmers
+        : status?.Roster.Select(r => new FarmerSnapshot(r.Id, r.Name, r.Status, r.Online, r.InTurn,
+            MemberId: r.Placeholder ? r.Id.ToString() : null, MemberName: r.Placeholder ? r.Name : null)).ToArray() ?? Array.Empty<FarmerSnapshot>();
+
+    /// <summary>
+    /// "Say who plays which farmer" (0.1.43). The farm matches people to farmers by itself and
+    /// gets it right as soon as each person has played once (0.1.42), but a guess can be wrong
+    /// and somebody at the farm always knows better. The owner, 2026-10-15: "fix or allow combining
+    /// in the UI in game?". First the member the farm is waiting on, then the farmer that is
+    /// theirs. Host only: it writes the farmers' records.
+    /// </summary>
+    private void ShowWhoMenu()
+    {
+        if (Game1.activeClickableMenu is not null || !Context.IsMainPlayer || coordinator is null || error is not null || Released || !ToolsUnlocked) return;
+        var roster = RosterSnapshot();
+        if (whoFor is null)
+        {
+            var waiting = WhoIsWho.Waiting(roster);
+            if (waiting.Count == 0) { toolsQueued = true; return; }
+            var rows = waiting.Select(w => new Response("who:" + w.MemberId, $"{w.Name} is already here, as...")).ToList();
+            rows.Add(new Response("back", "Back"));
+            OpenMenu($"The farm is waiting for {NameList(waiting.Select(w => w.Name).ToArray())} to make a farmer. If one of them is already on the farm under another name, say so and the farm will stop waiting for them twice.",
+                rows, answer =>
+                {
+                    if (answer.StartsWith("who:", StringComparison.Ordinal)) { whoFor = answer[4..]; whoQueued = true; }
+                    else toolsQueued = true;
+                });
+            return;
+        }
+        string member = whoFor;
+        string memberName = coordinator.Group.FirstOrDefault(m => m.AccountId == member)?.Name ?? "That member";
+        long? hostFarmer = Config.IncludeHost ? null : Game1.MasterPlayer.UniqueMultiplayerID;
+        var candidates = WhoIsWho.CandidatesFor(roster, id => OwnerOf(id).Name, hostFarmer);
+        if (candidates.Count == 0) { whoFor = null; toolsQueued = true; return; }
+        var choices = candidates.Select(c => new Response("whois:" + c.Id, WhoIsWho.Label(c))).ToList();
+        choices.Add(new Response("back", "Back"));
+        OpenMenu($"Which farmer does {memberName} play?", choices, answer =>
+        {
+            if (answer.StartsWith("whois:", StringComparison.Ordinal) && long.TryParse(answer[6..], out long farmerId))
+            {
+                var picked = candidates.First(c => c.Id == farmerId);
+                whoConfirm = (member, memberName, farmerId, picked.Name);
+            }
+            else { whoFor = null; whoQueued = true; }
+        });
+    }
+
+    /// <summary>Asks once more, then writes it down and lets the roster settle.</summary>
+    private void ShowWhoConfirm()
+    {
+        if (Game1.activeClickableMenu is not null || whoConfirm is not { } ask) return;
+        whoConfirm = null;
+        OpenMenu(WhoIsWho.Confirm(ask.MemberName, ask.FarmerName),
+            new List<Response> { new("no", "No, go back"), new("yes", $"Yes, {ask.FarmerName} is {ask.MemberName}'s") },
+            answer =>
+            {
+                if (answer != "yes") { whoQueued = true; return; }
+                SayWhoPlays(ask.MemberId, ask.MemberName, ask.FarmerId, ask.FarmerName);
+                whoFor = null;
+                toolsQueued = true;
+            });
+    }
+
+    /// <summary>Writes a farmer down as a member's, and lets the day's roster settle around it.</summary>
+    private void SayWhoPlays(string memberId, string memberName, long farmerId, string farmerName)
+    {
+        var farmer = Game1.getAllFarmers().FirstOrDefault(f => f.UniqueMultiplayerID == farmerId);
+        if (farmer is null || coordinator is null) return;
+        try
+        {
+            Ownership.Set(farmer, memberId, memberName);
+            checkpointPending = true;
+            RefreshOwners();
+            if (coordinator.Group.Count > 0) coordinator.SetGroup(WithOwnedFarmers(coordinator.Group));
+            SitOutSpareFarmers();
+            string said = WhoIsWho.Said(memberName, farmerName);
+            Monitor.Log(said, LogLevel.Info);
+            Game1.addHUDMessage(new HUDMessage(said));
+            Broadcast();
+        }
+        catch (EmptyGroupException) { }
+        catch (Exception ex) { Monitor.Log($"Could not say that {farmerName} is {memberName}'s: {ex.Message}", LogLevel.Warn); }
+    }
+
+    /// <summary>One of this mod's own menus: the same shape every time (0.1.43).</summary>
+    private void OpenMenu(string text, List<Response> choices, Action<string> answered)
+    {
+        waitingMenuSelection = null;
+        waitingMenuDescription = Describe();
+        waitingMenuCanFinish = CanFinishLocal;
+        skipMenuOpen = fixMenuOpen = false;
+        AskQuestion(text, choices.ToArray(), (_, answer) => answered(answer));
+        waitingMenu = Game1.activeClickableMenu;
+    }
+
     private void ShowToolsMenu()
     {
         if (Game1.activeClickableMenu is not null || status is null || Released || !ToolsUnlocked) return;
         var choices = status.Roster
+            .Where(r => !r.Placeholder)
             .Select(r => new Response("tools:fresh:" + r.Id, r.Id == Game1.player.UniqueMultiplayerID ? "Give me a fresh day" : $"Give {r.Name} a fresh day"))
             .ToList();
         choices.Add(new Response("tools:restart", "Restart today for everyone"));
+        // 0.1.43: say who is who, when the farm is waiting for somebody twice.
+        if (WhoIsWho.Waiting(RosterSnapshot()).Count > 0) choices.Add(new Response("tools:who", "Say who plays which farmer"));
         choices.Add(new Response("back", "Back"));
         waitingMenuSelection = null;
         waitingMenuDescription = Describe();
@@ -2467,6 +2931,7 @@ public sealed class ModEntry : StardewModdingAPI.Mod
             choices.ToArray(), (_, answer) =>
             {
                 if (answer.StartsWith("tools:fresh:", StringComparison.Ordinal) && long.TryParse(answer[12..], out long id)) freshConfirmFor = id;
+                else if (answer == "tools:who") { whoFor = null; whoQueued = true; }
                 else if (answer == "tools:restart") restartConfirmQueued = true;
                 else waitingMenuQueued = true;
             });
@@ -2828,7 +3293,8 @@ public sealed class ModEntry : StardewModdingAPI.Mod
             {
                 string who = string.Join(" ", args.Skip(1));
                 var match = coordinator.Snapshot.Farmers.Where(f => f.Id.ToString() == who
-                    || string.Equals(f.Name, who, StringComparison.OrdinalIgnoreCase)).ToArray();
+                    || string.Equals(f.Name, who, StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(f.MemberName, who, StringComparison.OrdinalIgnoreCase)).ToArray();
                 if (match.Length != 1) throw new InvalidOperationException($"No single farmer named or numbered '{who}' is on today's roster.");
                 SkipFarmer(match[0].Id);
             }
@@ -2842,9 +3308,35 @@ public sealed class ModEntry : StardewModdingAPI.Mod
             {
                 string who = string.Join(" ", args.Skip(1));
                 var match = coordinator.Snapshot.Farmers.Where(f => f.Id.ToString() == who
-                    || string.Equals(f.Name, who, StringComparison.OrdinalIgnoreCase)).ToArray();
+                    || string.Equals(f.Name, who, StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(f.MemberName, who, StringComparison.OrdinalIgnoreCase)).ToArray();
                 if (match.Length != 1) throw new InvalidOperationException($"No single farmer named or numbered '{who}' is on today's roster.");
                 ApplyFix(Game1.player.UniqueMultiplayerID, new FixRequest { Day = coordinator.Snapshot.AbsoluteDay, Kind = args[0], Target = match[0].Id });
+            }
+            else if (args.Length == 1 && args[0] == "skip_rest")
+            {
+                int done = SkipTheRestOfToday("the host's console");
+                Monitor.Log(done == 0 ? "Nobody is waiting to play today." : $"{done} farmer(s) sit today out; the night runs once whoever is playing has finished.", LogLevel.Info);
+            }
+            else if (args.Length >= 3 && args[0] == "owner" || args.Length >= 2 && args[0] == "disown")
+            {
+                // shared_day owner <farmer name or id> <account id> [name...]; shared_day disown <farmer name or id>
+                string who = args[1];
+                var match = Game1.getAllFarmers().Where(f => !f.IsMainPlayer && !f.isUnclaimedFarmhand
+                    && (f.UniqueMultiplayerID.ToString() == who || string.Equals(f.Name, who, StringComparison.OrdinalIgnoreCase))).ToArray();
+                if (match.Length != 1) throw new InvalidOperationException($"No single farmer named or numbered '{who}' is on this farm.");
+                if (args[0] == "disown")
+                {
+                    Monitor.Log(Ownership.Clear(match[0]) ? $"{match[0].Name} belongs to nobody now." : $"{match[0].Name} belonged to nobody.", LogLevel.Info);
+                }
+                else
+                {
+                    string accountId = args[2];
+                    string? name = args.Length > 3 ? string.Join(" ", args.Skip(3)) : MemberName(accountId);
+                    Ownership.Set(match[0], accountId, name);
+                    Monitor.Log($"{match[0].Name} belongs to {name ?? accountId} (ModRelay account {accountId}).", LogLevel.Info);
+                }
+                checkpointPending = true;
             }
             else if (args.Length >= 2 && args[0] is "bar" or "unbar" or "free_cabin")
             {
@@ -3090,7 +3582,7 @@ public sealed class ModEntry : StardewModdingAPI.Mod
         if (!Active || !Context.IsWorldReady || status is null || Released || status.HasFatalError || status.Error is not null) return null;
         long me = Game1.player.UniqueMultiplayerID;
         bool othersUp = status.Mode == PlayMode.Together && status.Roster.Any(r => r.Id != me && r.Status == FarmerStatus.Pending);
-        return BedQuestion.Wording(CanFinishLocal, status.Mode, IsLastToPlay, othersUp, ShortDate());
+        return BedQuestion.Wording(CanFinishLocal, status.Mode, IsLastToPlay, othersUp, ShortDate(), IsAloneOnRoster);
     }
 
     private void TickBedWording()
@@ -3137,6 +3629,8 @@ public sealed class ModEntry : StardewModdingAPI.Mod
         foreach (var orders in tracker.TakeOrders())
         {
             foreach (long id in orders.Barred) Bar(id, "the turn tracker");
+            ApplyGroup(orders.Members);
+            ApplySkipOrders(orders.Skips);
             if (orders.NewFarmers is { } allowed && allowed != newFarmersAllowed)
             {
                 newFarmersAllowed = allowed;
@@ -3145,6 +3639,79 @@ public sealed class ModEntry : StardewModdingAPI.Mod
                 Monitor.Log(allowed ? "New farmers may claim a cabin again: the turn tracker says so."
                     : "No new farmer may claim a cabin: the turn tracker says the group takes nobody new.", LogLevel.Info);
             }
+        }
+    }
+
+    /// <summary>
+    /// The farm's group, as the turn tracker answered (0.1.37, see DayCoordinator.SetGroup): a member
+    /// with no farmer here stands on the roster as "Name (no farmer yet)", and the day waits for them
+    /// like for any farmer until they make one or are skipped. Null (an older server) changes nothing.
+    /// </summary>
+    private void ApplyGroup(IReadOnlyList<GroupMember>? members)
+    {
+        if (members is null || coordinator is null || error is not null) return;
+        try
+        {
+            // 0.1.39: the account that set up the host PC is the farm's host, not a player, unless the
+            // host's own farmer takes turns (Squeet Farm, 2026-10-15 13:10: "HostPC" was taken for
+            // MOSS's player, and both real members stood as placeholders).
+            if (!Config.IncludeHost) members = members.Where(m => !m.Host).ToList();
+            // A group of only the host PC is no reason to forget the players (0.1.41).
+            if (members.Count == 0 && coordinator.Group.Count > 0) return;
+            AdoptOwners(members);
+            var before = coordinator.Snapshot.Farmers.Where(f => f.IsPlaceholder).Select(f => f.Name).ToArray();
+            if (!coordinator.SetGroup(WithOwnedFarmers(members))) return;
+            checkpointPending = true;
+            var after = coordinator.Snapshot.Farmers.Where(f => f.IsPlaceholder).Select(f => f.Name).ToArray();
+            foreach (string name in after.Except(before))
+                Monitor.Log($"{name}: a member of this farm's group has no farmer here, so {ShortDate()} waits for them until they make one or are skipped.", LogLevel.Info);
+            foreach (string name in before.Except(after))
+                Monitor.Log($"{name} is no longer waited for: they have a farmer here now, or left the group.", LogLevel.Info);
+            EnsureCabins();
+            Broadcast();
+        }
+        catch (EmptyGroupException)
+        {
+            // The server could not read its own members. Keeping the group this farm already has is
+            // the whole point: an empty one would clear the placeholders and let a lone farmer end the day.
+            if (groupEmptyLogged) return;
+            groupEmptyLogged = true;
+            Monitor.Log("The turn tracker answered with no members at all, which cannot be right for a farm that has a group, so the farm keeps the group it knows. Nobody has been dropped from today's roster.", LogLevel.Warn);
+        }
+        catch (Exception ex) { Monitor.Log("Could not apply the farm's group from the turn tracker: " + ex.Message, LogLevel.Warn); }
+    }
+
+    /// <summary>
+    /// A cabin for every group member who still has to make a farmer (0.1.40, see <see cref="Cabins"/>).
+    /// The owner, 2026-10-15: "cabins shouldnt matter". Without this a full farm would hold the day for
+    /// a member who could not make the farmer it is waiting for.
+    /// </summary>
+    private void EnsureCabins()
+    {
+        if (!Context.IsMainPlayer || coordinator is null || error is not null || !Config.BuildCabinsForGroup) return;
+        var day = coordinator.Snapshot;
+        if (day.Phase != DayPhase.Open) return;
+        int waiting = day.Farmers.Count(f => f.IsPlaceholder && f.Status == FarmerStatus.Pending);
+        if (waiting == 0) return;
+        try
+        {
+            if (Cabins.Ensure(waiting, Monitor) > 0) checkpointPending = true;
+        }
+        catch (Exception ex) { Monitor.Log("Could not build a cabin for the group: " + ex.Message, LogLevel.Warn); }
+    }
+
+    /// <summary>Skips the group asked for from the launcher (0.1.38): applied like the host's own skip, for today only, to a farmer still to play who is not on the farm.</summary>
+    private void ApplySkipOrders(IReadOnlyList<SkipOrder>? skips)
+    {
+        if (skips is null || skips.Count == 0 || coordinator is null || error is not null) return;
+        var day = coordinator.Snapshot;
+        foreach (var order in skips)
+        {
+            if (order.Day != day.AbsoluteDay) continue;
+            var farmer = day.Farmers.FirstOrDefault(f => f.Id == order.FarmerId);
+            if (farmer is null || farmer.Status != FarmerStatus.Pending || farmer.IsOnline) continue;
+            Monitor.Log($"The group asked from the launcher that {farmer.Name} sit {ShortDate()} out.", LogLevel.Info);
+            SkipFarmer(order.FarmerId);
         }
     }
 
@@ -3166,11 +3733,11 @@ public sealed class ModEntry : StardewModdingAPI.Mod
     /// Tells a removed farmer why and disconnects them a moment later, so the line reaches their
     /// chat before the connection goes (a kick in the same tick dropped it, seen in the lab).
     /// </summary>
-    private void KickLater(long id)
+    private void KickLater(long id, string? reason = null)
     {
         rejectedPeers.Add(id);
         if (kicksDue.ContainsKey(id)) return;
-        Tell(id, Barring.Reason);
+        Tell(id, reason ?? Barring.Reason);
         kicksDue[id] = 90;
     }
 

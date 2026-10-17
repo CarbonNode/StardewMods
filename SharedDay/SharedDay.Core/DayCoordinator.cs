@@ -1,3 +1,6 @@
+using System.Security.Cryptography;
+using System.Text;
+
 namespace SharedDay.Core;
 
 /// <summary>
@@ -12,6 +15,7 @@ public sealed class DayCoordinator
     private readonly Dictionary<long, FarmerJournal> farmers;
     private readonly HashSet<long> online = new();
     private readonly HashSet<long> currentSession;
+    private readonly List<GroupMember> group;
     private string saveId;
     private int absoluteDay;
     private long revision;
@@ -32,6 +36,7 @@ public sealed class DayCoordinator
         advanceToken = journal.AdvanceToken;
         farmers = journal.Farmers.ToDictionary(f => f.Id, f => f with { });
         currentSession = journal.CurrentSessionFarmerIds.ToHashSet();
+        group = NormalizeGroup(journal.Group);
     }
 
     public static DayCoordinator Create(string saveId, int absoluteDay, IEnumerable<FarmerIdentity> roster, PlayMode mode = PlayMode.Relay)
@@ -60,13 +65,31 @@ public sealed class DayCoordinator
     /// Otherwise a farm whose whole group is on holiday would run through its calendar by itself
     /// every time it was woken.
     /// </remarks>
-    public bool IsReadyToAdvance => farmers.Count > 0 && farmers.Values.All(f => f.Status != FarmerStatus.Pending)
+    public bool IsReadyToAdvance => farmers.Values.Any(f => !f.IsPlaceholder) && farmers.Values.All(f => f.Status != FarmerStatus.Pending)
         && farmers.Values.Any(f => !f.Away)
         && (mode != PlayMode.Together || farmers.Values.Where(f => f.Status != FarmerStatus.Skipped).All(f => online.Contains(f.Id)));
 
     public DaySnapshot Snapshot => new(saveId, absoluteDay, revision, mode, phase, sessionNumber, advanceToken,
         IsReadyToAdvance, Array.AsReadOnly(farmers.Values.Select(f => new FarmerSnapshot(
-            f.Id, f.Name, f.Status, online.Contains(f.Id), currentSession.Contains(f.Id), f.AbsentDays, f.Away, f.TimeReached, f.Waiting, f.NightsOwedFrom)).ToArray()));
+            f.Id, f.IsPlaceholder ? PlaceholderLabel(f.Name) : f.Name, f.Status, online.Contains(f.Id), currentSession.Contains(f.Id), f.AbsentDays, f.Away, f.TimeReached, f.Waiting, f.NightsOwedFrom,
+            f.MemberId, f.IsPlaceholder ? f.Name : null)).ToArray()));
+
+    /// <summary>The farm's ModRelay group as last given to <see cref="SetGroup"/> (0.1.37); empty when there is none.</summary>
+    public IReadOnlyList<GroupMember> Group => group.AsReadOnly();
+
+    /// <summary>How a placeholder is named wherever farmers are listed: "Pat (no farmer yet)".</summary>
+    public static string PlaceholderLabel(string memberName) => memberName + " (no farmer yet)";
+
+    /// <summary>
+    /// The roster id a placeholder stands under: derived from the account id, so the same member
+    /// gets the same id on every farm and every day (and a skip, a vote or a console command can
+    /// name it). The game's own farmer ids are random 64-bit numbers; a clash is not a real risk.
+    /// </summary>
+    public static long PlaceholderId(string accountId)
+    {
+        var hash = SHA256.HashData(Encoding.UTF8.GetBytes("SharedDay.Placeholder\n" + accountId));
+        return BitConverter.ToInt64(hash, 0);
+    }
 
     /// <summary>
     /// How many days in a row a farmer may miss before the farm stops waiting for them: from
@@ -88,8 +111,138 @@ public sealed class DayCoordinator
         SessionNumber = sessionNumber,
         AdvanceToken = advanceToken,
         Farmers = farmers.Values.Select(f => f with { }).ToList(),
-        CurrentSessionFarmerIds = currentSession.OrderBy(id => id).ToList()
+        CurrentSessionFarmerIds = currentSession.OrderBy(id => id).ToList(),
+        Group = group.Select(m => m with { }).ToList()
     };
+
+    /// <summary>
+    /// The farm's ModRelay group, as the turn tracker reports it (0.1.37). The owner, 2026-10-15,
+    /// after Squeet Farm went from Spring 1 to Spring 3 in two minutes because the only farmer on
+    /// the save was the only one on the roster: "fix what caused / allowed this". The day's roster
+    /// is no longer just the farmers in the save: every group member who cannot be matched to a
+    /// farmer on the farm stands on it as a placeholder, "Pat (no farmer yet)", still to play.
+    /// The day cannot end while one is pending; it can be skipped exactly like an absent farmer
+    /// (it keeps nothing and is back tomorrow), and it sits days out under <see cref="AbsenceLimit"/>
+    /// like a farmer who never connects. The moment a farmer appears for it, the placeholder goes
+    /// and that farmer plays today.
+    ///
+    /// Matching, in this order: the farmer a member picked in the launcher (<see cref="GroupMember.FarmerId"/>);
+    /// a farmer whose name is the member's; and then the plain count, so that nobody has to pick
+    /// "I'm playing as" for the guard to work: as many of the remaining members as there are
+    /// farmers left over are taken to be playing them (the longest-standing members first), and
+    /// only the members beyond that get a placeholder. The group is kept in the journal, so a
+    /// host that comes back from a checkpoint still has it.
+    /// </summary>
+    /// <param name="members">The group; null or empty means the farm has no group, and every placeholder goes.</param>
+    /// <returns>True when the group or the roster changed. Nothing changes during the night's transition except the stored group.</returns>
+    public bool SetGroup(IEnumerable<GroupMember>? members)
+    {
+        var next = NormalizeGroup(members);
+        // A group that has members cannot legitimately become an empty one: a group nobody is left
+        // in is deleted, and its farm is then told of no group at all rather than of nobody in it.
+        // An empty list is therefore a server that could not read its own members (0.1.41), and
+        // taking it at its word would clear every placeholder and let one farmer end the day again,
+        // which is the very thing this guard exists to stop.
+        if (next.Count == 0 && group.Count > 0) throw new EmptyGroupException();
+        bool changed = !next.SequenceEqual(group);
+        if (changed)
+        {
+            group.Clear();
+            group.AddRange(next);
+            Changed();
+        }
+        if (phase != DayPhase.Open) return changed;
+        return Reconcile() || changed;
+    }
+
+    /// <summary>
+    /// The account each farmer on the roster belongs to, as the adapter knows it (0.1.42). Used to
+    /// keep one person from holding the day twice: a member stands on the roster once, whether they
+    /// have one farmer here or three. The adapter sets it whenever an owner is learned.
+    /// </summary>
+    public IDictionary<long, string> FarmerOwners { get; } = new Dictionary<long, string>();
+
+    /// <summary>
+    /// Farmers that only hold the day because one person has more than one of them (0.1.42):
+    /// every farmer after the first of an account, counting the one being played or already played
+    /// first. The owner, 2026-10-15: "and what about duplicates of same person?" — the farm waited on
+    /// MOSS and on M0SSLING, who are one man. An abandoned farmer of somebody who is here under
+    /// another name must not hold the night.
+    /// </summary>
+    public IReadOnlyList<long> SpareFarmersOf(string accountId)
+    {
+        var mine = farmers.Values
+            .Where(f => !f.IsPlaceholder && FarmerOwners.TryGetValue(f.Id, out var owner) && owner == accountId)
+            .ToList();
+        if (mine.Count < 2) return Array.Empty<long>();
+        // The one that counts: played today, else on the farm now, else the furthest through the day.
+        var keep = mine.FirstOrDefault(f => f.Status == FarmerStatus.Completed)
+            ?? mine.FirstOrDefault(f => online.Contains(f.Id))
+            ?? mine.OrderByDescending(f => f.TimeReached ?? 0).First();
+        return mine.Where(f => f.Id != keep.Id).Select(f => f.Id).ToList();
+    }
+
+    /// <summary>Makes the placeholders match the group and the farmers now on the roster (see <see cref="SetGroup"/>). Open days only.</summary>
+    private bool Reconcile()
+    {
+        var unmatched = farmers.Values.Where(f => !f.IsPlaceholder).ToList();
+        var unpicked = new List<GroupMember>();
+        foreach (var member in group)
+        {
+            if (member.FarmerId is { } picked && unmatched.RemoveAll(f => f.Id == picked) > 0) continue;
+            unpicked.Add(member);
+        }
+        var unnamed = new List<GroupMember>();
+        foreach (var member in unpicked)
+        {
+            int byName = unmatched.FindIndex(f => string.Equals(f.Name.Trim(), member.Name, StringComparison.OrdinalIgnoreCase));
+            if (byName >= 0) unmatched.RemoveAt(byName);
+            else unnamed.Add(member);
+        }
+        // The farmers left over are somebody's: as many of the remaining members as there are of
+        // them are taken to be playing those farmers. The rest have no farmer here.
+        var wanted = unnamed.Skip(unmatched.Count).ToList();
+        bool changed = false;
+        foreach (var stale in farmers.Values.Where(f => f.IsPlaceholder && wanted.All(m => m.AccountId != f.MemberId)).ToList())
+        {
+            farmers.Remove(stale.Id);
+            online.Remove(stale.Id);
+            currentSession.Remove(stale.Id);
+            changed = true;
+        }
+        foreach (var member in wanted)
+        {
+            var standing = farmers.Values.FirstOrDefault(f => f.MemberId == member.AccountId);
+            if (standing is not null)
+            {
+                if (standing.Name == member.Name) continue;
+                farmers[standing.Id] = standing with { Name = member.Name };
+                changed = true;
+                continue;
+            }
+            long id = PlaceholderId(member.AccountId);
+            if (farmers.ContainsKey(id)) continue;
+            farmers.Add(id, new FarmerJournal(id, member.Name, FarmerStatus.Pending, MemberId: member.AccountId));
+            changed = true;
+        }
+        if (changed) Changed();
+        return changed;
+    }
+
+    private static List<GroupMember> NormalizeGroup(IEnumerable<GroupMember>? members)
+    {
+        var list = new List<GroupMember>();
+        if (members is null) return list;
+        foreach (var member in members)
+        {
+            if (member is null || string.IsNullOrWhiteSpace(member.AccountId)) continue;
+            string account = member.AccountId.Trim();
+            if (list.Any(m => m.AccountId == account)) continue;
+            string name = string.IsNullOrWhiteSpace(member.Name) ? "A group member" : member.Name.Trim();
+            list.Add(new GroupMember(account, name, member.FarmerId, member.Host));
+        }
+        return list;
+    }
 
     /// <summary>
     /// The farmers playing right now: connected, still to play, in the turn in progress and not
@@ -216,6 +369,8 @@ public sealed class DayCoordinator
         if (farmers.ContainsKey(farmer.Id)) return false;
         RequireOpen();
         farmers.Add(farmer.Id, new FarmerJournal(farmer.Id, farmer.Name, FarmerStatus.Pending));
+        // A farmer who appears for a group member with none takes that member's place on the roster today.
+        Reconcile();
         Changed();
         return true;
     }
@@ -473,6 +628,14 @@ public sealed class DayCoordinator
             int? owed = here ? before.NightsOwedFrom : before.NightsOwedFrom ?? ended;
             next[i] = next[i] with { AbsentDays = absent, SeenToday = here, Away = away, Status = away ? FarmerStatus.Skipped : FarmerStatus.Pending, NightsOwedFrom = owed };
         }
+        // A group member with no farmer yet is on the next day's roster too, and has been away a
+        // day more: past the limit the farm stops waiting for them, as for a farmer who never connects.
+        foreach (var placeholder in farmers.Values.Where(f => f.IsPlaceholder))
+        {
+            int absent = checked(placeholder.AbsentDays + 1);
+            bool away = AbsenceLimit > 0 && absent >= AbsenceLimit;
+            next.Add(placeholder with { AbsentDays = absent, SeenToday = false, Away = away, Status = away ? FarmerStatus.Skipped : FarmerStatus.Pending, TimeReached = null, Waiting = false, NightsOwedFrom = null });
+        }
         farmers.Clear();
         foreach (var farmer in next) farmers.Add(farmer.Id, farmer);
         online.IntersectWith(farmers.Keys);
@@ -486,6 +649,8 @@ public sealed class DayCoordinator
         foreach (var id in online) currentSession.Add(id);
         if (currentSession.Count > 0) sessionNumber = 1;
         Changed();
+        // A farmer made during the night just ended may be a member's first: their placeholder goes.
+        Reconcile();
     }
 
     private FarmerJournal FindFarmer(long id) => farmers.TryGetValue(id, out var farmer)
@@ -511,7 +676,7 @@ public sealed class DayCoordinator
         if (roster.Any(f => f is null || string.IsNullOrWhiteSpace(f.Name) || !Enum.IsDefined(typeof(FarmerStatus), f.Status)
                 || f.AbsentDays < 0 || (f.Away && f.Status != FarmerStatus.Skipped)
                 || (f.TimeReached is { } time && !DayClock.IsValid(time)) || (f.Waiting && f.Status != FarmerStatus.Pending)
-                || f.NightsOwedFrom is < 0))
+                || f.NightsOwedFrom is < 0 || (f.MemberId is not null && string.IsNullOrWhiteSpace(f.MemberId))))
             throw new DayCoordinationException("The roster contains an invalid farmer.");
         if (roster.Select(f => f.Id).Distinct().Count() != roster.Count)
             throw new DayCoordinationException("A farmer can appear only once in a day's roster.");

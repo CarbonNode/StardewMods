@@ -70,6 +70,10 @@ survives the host's clock stepping back), so a heartbeat always refreshes "last 
 | `farmers[].inCurrentTurn` | Part of the turn in progress. The game keeps this true for a farmer who finished and left until the next turn starts. |
 | `farmers[].away` | Optional, from Shared Day 0.1.28: `true` for a farmer who is `Skipped` only because the farm stopped waiting for them (not seen for `AwayAfterDays` farm days). The moment they connect they are `Pending` again and play today. Absent or `false` otherwise. |
 | `farmers[].portrait` | Optional, from Shared Day 0.1.11: the farmer's face as the game draws it, a small PNG as a `data:image/png;base64,` address. See "Portraits". |
+| `farmers[].placeholder` | Optional, from Shared Day 0.1.37: `true` for a member of the farm's group who has no farmer on the farm yet. The host puts them on the roster so the day cannot end without them: `name` is their ModRelay name, `id` is of the host's making (not a farmer anyone can claim; `PUT /turns/<id>/members/me` refuses it), `status` is `Pending` until they make a farmer or are skipped, and `online` is always false. The row goes the moment a farmer of theirs appears. The launcher says "Pat has no farmer yet". See "The group in the answer". |
+| `farmers[].account_id` | With `placeholder`: the ModRelay account id of that member. |
+| `farmers[].owner_id` | Optional, from Shared Day 0.1.37: the ModRelay account this farmer belongs to (the account whose launcher made it, a claim in the launcher the host adopted, or the host's console). The host turns away anyone else who picks it, and `PUT /turns/<id>/members/me` refuses a claim on it by another account. Absent for a farmer nobody owns yet. |
+| `farmers[].owner_name` | With `owner_id`: that account's name as the host knows it. |
 
 "Whose turn is it": in Relay, anyone `Pending` may play; the farm is waiting on the
 `Pending` farmers. In Together, the day ends once every non-skipped farmer is `Completed`
@@ -106,13 +110,83 @@ this farm's group.", and once they are offline deletes their farmhand so the cab
 `new_farmers: false` makes the host turn away anyone claiming a cabin as a new farmer; `true`
 opens it again. Both are kept in the host's save and applied again on every answer, so the
 tracker may repeat them. A `204`, an empty body or a body without either field means no orders; a
-host older than 0.1.29 ignores the body. `401` for a missing or wrong token, or an unknown tracker. `409`
+host older than 0.1.29 ignores the body. From Shared Day 0.1.37 the answer to a group's farm also
+carries the group (see "The group in the answer"). `401` for a missing or wrong token, or an unknown tracker. `409`
 if `sequence` is not newer, or if the report is for a different farm than the one the
 tracker first heard from (a tracker locks onto its first `farm.id`). `413` above 64 KB.
 `400` for invalid JSON, another `schema` or a missing `sequence`; `415` for a content type
 other than JSON. The host treats every rejection the same way: one warning in its log, then
 it keeps playing; it never retries in a loop, the next change or heartbeat sends a fresh
 snapshot. The token is opaque to the host (ModRelay's start with `sdt_`).
+
+## The group in the answer (0.1.37, server of 2026-10-15)
+
+The owner, 2026-10-15, after Squeet Farm went from Spring 1 to Spring 3 in two minutes: the only
+farmer on the save was the only one on the roster, so his two bedtimes ended two days for a
+group of two. The roster is no longer just the farmers in the save. A tracker that belongs to a
+group answers every accepted report with the group's members as well:
+
+```json
+{ "barred": [], "new_farmers": true,
+  "members": [ { "id": "<account id>", "name": "Pat", "farmer_id": null },
+               { "id": "<account id>", "name": "Casey", "farmer_id": "2283117480133497730" } ] }
+```
+
+`members` lists the group's members (the invited are not members yet), longest-standing first:
+the ModRelay account id, the name the launcher shows, and `farmer_id`, the farmer they picked on
+this tracker ("I'm playing as", or the farmer the launcher enrolled from the game's log), or
+`null`. A farm without a group gets no `members` key, and the host keeps the group it has; an
+empty list means the group has gone, and every placeholder with it.
+
+The host matches members to farmers in this order: the member's `farmer_id`; a farmer whose name
+is the member's (case does not matter); and then the plain count, so that nobody has to pick a
+farmer for the guard to work: as many of the remaining members as there are farmers left over are
+taken to be playing them (longest-standing first), and only the members beyond that get a
+placeholder. Every placeholder is reported as a `farmers[]` row with `placeholder: true` and the
+member's `account_id`, and is kept in the host's save with the rest of the day, so a restart keeps
+a skip that was made today. A placeholder can be skipped like an absent farmer (the host's popup,
+the vote, `shared_day skip Pat`); it keeps nothing and is back tomorrow. Under `AwayAfterDays` a
+member who never makes a farmer sits days out like a farmer who never connects.
+
+## Cabins for the group (0.1.40)
+
+A member with no farmer yet holds the day open (see above), so the host keeps a free cabin for
+every such member, building one beside the farmhouse the game's own way when none is free. It is
+all host-side: nothing in this contract changes, and the tracker is told nothing new. A host with
+`BuildCabinsForGroup: false` builds none, and a farm with no room says so in its log.
+
+## A skip asked for from the launcher (0.1.38, server of 2026-10-15)
+
+The owner: "with a Skip/Sit-out control for the host and the vote". A member asks in the launcher
+that a farmer (a member with no farmer yet, or an absent one) sit the farm's current day out:
+`POST /turns/<id>/skips { farmer_id, day }`, `day` being the report's `date.absoluteDay`, so an
+ask made on an old report never skips the next day. The group's owner, or whoever set up the
+host PC, decides alone; anyone else needs more than half of the other members (nobody votes on
+their own farmer). The answer to every report then carries the asks that passed:
+
+```json
+{ "barred": [], "new_farmers": true, "skips": [ { "farmer_id": "-1234567890123456789", "day": 3 } ] }
+```
+
+The host applies each like its own skip (the farmer keeps nothing and is back tomorrow), only
+while the farm is on that day and the farmer is still to play and not on the farm; the order
+repeats with every answer and does nothing once done. A host older than 0.1.38 ignores the field.
+`GET /turns/<id>` carries the tallies as `skips` (`voters`, `votes`, `needed`, `passed`).
+
+## Who joins: the launcher's join ticket (0.1.37, server of 2026-10-15)
+
+The host learns who a joining player is from their launcher. At Play, a signed-in launcher asks
+`GET /turns/<id>/ticket` (account Bearer; a group's farm answers its members only) and gets
+`{ "account_id", "display_name", "ticket", "expires_utc" }`; it writes the three into its Shared
+Day link file as `account: { id, name, ticket }`, and the player's Shared Day sends them to the
+host in its hello. The ticket is `"<expiry unix seconds>.<base64url HMAC-SHA256>"` over
+`"modrelay.join-ticket/1\n<tracker id>\n<account id>\n<name>\n<expiry>"`, keyed by the SHA-256
+of the tracker's token: the server keeps only that hash, the host holds the token, so the host
+checks a ticket by itself. It is good for a day, for this farm, this account and this name; a
+hello without one, or with one that does not check out, is a player with no account. The host
+records the account as the owner of a farmer it makes (`owner_id` above) and refuses another
+account's farmer; a group's farm refuses a player with no account in the group. The file never
+carries an account token.
 
 ## Compatibility
 

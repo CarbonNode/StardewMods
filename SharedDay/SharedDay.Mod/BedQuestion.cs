@@ -20,11 +20,13 @@ internal static class BedQuestion
     /// <param name="last">Every other roster farmer has played or sits today out: this one is the last.</param>
     /// <param name="othersStillUp">Together only: somebody else is not in bed yet.</param>
     /// <param name="date">"Spring 13".</param>
+    /// <param name="alone">This farmer is the only entry on today's roster (0.1.37): their sleep ends the day for the whole farm, and nobody else is waited for.</param>
     /// <returns>The question, or null for the game's own text.</returns>
-    internal static string? Wording(bool active, PlayMode mode, bool last, bool othersStillUp, string date)
+    internal static string? Wording(bool active, PlayMode mode, bool last, bool othersStillUp, string date, bool alone = false)
     {
         if (!active) return null;
         if (mode == PlayMode.Together && othersStillUp) return "Go to sleep? The night starts once everyone is in bed.";
+        if (alone) return $"Go to sleep? You are the only farmer on today's roster, so this ends {date} for the whole farm. Nobody else is waited for.";
         if (last) return $"Go to sleep? You are the last to play {date}: the night then runs for everyone.";
         return $"Go to sleep? This ends your turn for {date}. You can't play again until the next day.";
     }

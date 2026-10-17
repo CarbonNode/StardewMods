@@ -1,7 +1,7 @@
 {
   "Name": "Shared Day",
   "Author": "squeetsquib",
-  "Version": "0.1.35",
+  "Version": "0.1.44",
   "Description": "Experimental shared-calendar co-op: take turns on a farm day, then advance together.",
   "UniqueID": "CarbonNode.SharedDay",
   "EntryDll": "SharedDay.dll",

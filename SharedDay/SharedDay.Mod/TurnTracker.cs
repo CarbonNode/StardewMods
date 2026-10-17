@@ -63,20 +63,29 @@ internal sealed class TurnTracker
     /// Call often (every second is fine); it decides itself whether to send. <paramref name="portrait"/>
     /// gives a farmer's face as a PNG address, or null; a face that changes is a change to report.
     /// </summary>
-    public void Update(DaySnapshot day, PlayMode mode, int furthestTime, string? paused, Func<long, string?>? portrait = null)
+    public void Update(DaySnapshot day, PlayMode mode, int furthestTime, string? paused, Func<long, string?>? portrait = null, Func<long, (string? Id, string? Name)>? owner = null)
     {
         if (!Enabled) return;
         bool faces = portrait is not null && Config.Portraits;
         var fitted = PortraitWire.Fit(day.Farmers.Select(f => faces ? portrait!(f.Id) : null).ToArray());
+        var owners = day.Farmers.Select(f => owner is null || f.IsPlaceholder ? (null, null) : owner(f.Id)).ToArray();
         var farmers = day.Farmers.Select((f, i) => new
         {
             id = f.Id.ToString(),
-            name = f.Name,
+            // A placeholder is sent under the member's own name: the launcher words "has no farmer yet" itself.
+            name = f.MemberName ?? f.Name,
             status = f.Status.ToString(),
             online = f.IsOnline,
             inCurrentTurn = f.IsInCurrentSession,
             // Sitting out only because they have not been seen for days: back in the day the moment they connect.
             away = f.Away,
+            // 0.1.37: a group member with no farmer on the farm yet, standing on the roster until they
+            // make one or are skipped. The key is only there for a placeholder; `account` is their ModRelay account id.
+            placeholder = f.IsPlaceholder ? true : (bool?)null,
+            account_id = f.MemberId,
+            // 0.1.37: the ModRelay account this farmer belongs to (see Ownership); absent for one nobody owns yet.
+            owner_id = owners[i].Item1,
+            owner_name = owners[i].Item2,
             portrait = fitted[i]
         }).ToArray();
         // Everything a player cares about except the clock, which moves every few seconds.

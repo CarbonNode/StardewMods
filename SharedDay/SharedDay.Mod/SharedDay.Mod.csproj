@@ -6,7 +6,7 @@
     <LangVersion>10</LangVersion>
     <AssemblyName>SharedDay</AssemblyName>
     <RootNamespace>SharedDay.Mod</RootNamespace>
-    <Version>0.1.34</Version>
+    <Version>0.1.43</Version>
     <EnableModDeploy>false</EnableModDeploy>
     <EnableHarmony>true</EnableHarmony>
     <EnableModZip>true</EnableModZip>
